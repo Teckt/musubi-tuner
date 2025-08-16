@@ -647,9 +647,13 @@ def _video_vae(pretrained_path=None, z_dim=None, device="cpu", **kwargs):
     logging.info(f"loading {pretrained_path}")
     if os.path.splitext(pretrained_path)[-1] == ".safetensors":
         sd = load_file(pretrained_path)
-        model.load_state_dict(sd, strict=False, assign=True)
+        # When loading on meta device, we need to use to_empty first
+        model = model.to_empty(device=device)
+        model.load_state_dict(sd, strict=False)
     else:
-        model.load_state_dict(torch.load(pretrained_path, map_location=device, weights_only=True), assign=True)
+        # For .pth files, load directly to target device
+        model = model.to_empty(device=device)
+        model.load_state_dict(torch.load(pretrained_path, map_location=device, weights_only=True))
 
     return model
 
@@ -700,16 +704,27 @@ class WanVAE:
         self.std = torch.tensor(std, dtype=dtype, device=device)
         self.scale = [self.mean, 1.0 / self.std]
 
-        # init model
-        self.model = (
-            _video_vae(
-                pretrained_path=vae_path,
-                z_dim=z_dim,
-            )
-            .eval()
-            .requires_grad_(False)
-            .to(device, dtype=dtype)
+        self.model = _video_vae(
+            pretrained_path=vae_path,
+            z_dim=z_dim,
+            device=device,  # Pass device to _video_vae
         )
+        
+        # Convert to target dtype
+        self.model = self.model.to(dtype=dtype)
+        self.model.eval()
+        self.model.requires_grad_(False)
+
+        # # init model
+        # self.model = (
+        #     _video_vae(
+        #         pretrained_path=vae_path,
+        #         z_dim=z_dim,
+        #     )
+        #     .eval()
+        #     .requires_grad_(False)
+        #     .to(device, dtype=dtype)
+        # )
         if cache_device is not None:
             self.model.set_cache_device(torch.device(cache_device))
 

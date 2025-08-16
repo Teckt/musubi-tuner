@@ -247,7 +247,9 @@ def main():
 
     logger.info(f"Loading VAE model from {vae_path}")
     vae_dtype = torch.bfloat16 if args.vae_dtype is None else str_to_dtype(args.vae_dtype)
+    print("vae_dtype", vae_dtype)
     cache_device = torch.device("cpu") if args.vae_cache_cpu else None
+    print("cache_device", cache_device)
     vae = WanVAE(vae_path=vae_path, device=device, dtype=vae_dtype, cache_device=cache_device)
 
     if args.clip is not None:
