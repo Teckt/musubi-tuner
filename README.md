@@ -1,5 +1,7 @@
 # Musubi Tuner
 
+THIS IS A FORK OF MUSUBI TUNER INTEGRATED WITH GRADIO FOR WAN2.1/2.2 - FP8 TRAINING IMPLEMENTED
+
 [English](./README.md) | [日本語](./README.ja.md)
 
 ## Table of Contents
