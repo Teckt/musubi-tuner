@@ -733,6 +733,10 @@ class MusubiTrainerUI:
         with gr.Group():
             gr.Markdown("## Configuration Management")
             
+            # Show current config directory
+            gr.Markdown(f"**Configuration Directory**: `{self.config_manager.config_dir}`")
+            gr.Markdown("*You can change this by setting `CONFIG_DIR` in `.env`*")
+            
             with gr.Row():
                 config_name = gr.Textbox(
                     label="Configuration Name",

@@ -238,9 +238,14 @@ class WanSelfAttention(nn.Module):
         # q, k, v = qkv_fn(x)
         # del x
         # query, key, value function
+        # Get the appropriate dtype for computation (avoid FP8)
+        if hasattr(self.q, 'scale_weight') and self.q.weight.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
+            target_dtype = self.q.scale_weight.dtype
+        else:
+            target_dtype = self.q.weight.dtype
 
-        if x.dtype != self.q.weight.dtype:
-            x = x.to(self.q.weight.dtype)
+        if x.dtype != target_dtype:
+            x = x.to(target_dtype)
         q = self.q(x)
         k = self.k(x)
         v = self.v(x)
@@ -261,8 +266,14 @@ class WanSelfAttention(nn.Module):
 
         # output
         x = x.flatten(2)
-        if x.dtype != self.o.weight.dtype:
-            x = x.to(self.o.weight.dtype)
+        # Get the appropriate dtype for computation (avoid FP8)
+        if hasattr(self.o, 'scale_weight') and self.o.weight.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
+            target_dtype = self.o.scale_weight.dtype
+        else:
+            target_dtype = self.o.weight.dtype
+            
+        if x.dtype != target_dtype:
+            x = x.to(target_dtype)
         x = self.o(x)
         return x
 
@@ -282,8 +293,14 @@ class WanCrossAttention(WanSelfAttention):
         # q = self.norm_q(self.q(x)).view(b, -1, n, d)
         # k = self.norm_k(self.k(context)).view(b, -1, n, d)
         # v = self.v(context).view(b, -1, n, d)
-        if x.dtype != self.q.weight.dtype:
-            x = x.to(self.q.weight.dtype)
+        # Get the appropriate dtype for computation (avoid FP8)
+        if hasattr(self.q, 'scale_weight') and self.q.weight.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
+            target_dtype = self.q.scale_weight.dtype
+        else:
+            target_dtype = self.q.weight.dtype
+            
+        if x.dtype != target_dtype:
+            x = x.to(target_dtype)
 
         q = self.q(x)
         del x
@@ -455,24 +472,45 @@ class WanAttentionBlock(nn.Module):
             assert e[0].dtype == torch.float32
 
             # self-attention
-            if x.dtype != self.self_attn.q.weight.dtype:
-                x = x.to(self.self_attn.q.weight.dtype)
+            # Get the appropriate dtype for computation (avoid FP8)
+            if hasattr(self.self_attn.q, 'scale_weight') and self.self_attn.q.weight.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
+                target_dtype = self.self_attn.q.scale_weight.dtype
+            else:
+                target_dtype = self.self_attn.q.weight.dtype
+                
+            if x.dtype != target_dtype:
+                x = x.to(target_dtype)
             y = self.self_attn(self.norm1(x).float() * (1 + e[1].squeeze(2)) + e[0].squeeze(2), seq_lens, grid_sizes, freqs)
+            x = x.to(torch.float32)  # Ensure x is in float32 before adding
             x = x + y.to(torch.float32) * e[2].squeeze(2)
             del y
 
             # cross-attention & ffn
-            if x.dtype != self.cross_attn.q.weight.dtype:
-                x = x.to(self.cross_attn.q.weight.dtype)
-            x = x + self.cross_attn(self.norm3(x), context, context_lens)
+            # Get the appropriate dtype for computation (avoid FP8)
+            if hasattr(self.cross_attn.q, 'scale_weight') and self.cross_attn.q.weight.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
+                target_dtype = self.cross_attn.q.scale_weight.dtype
+            else:
+                target_dtype = self.cross_attn.q.weight.dtype
+                
+            if x.dtype != target_dtype:
+                x = x.to(target_dtype)
+            y = self.cross_attn(self.norm3(x), context, context_lens)
+            x = x.to(torch.float32)  # Ensure x is in float32 before adding
+            x = x + y.to(torch.float32)
             del context
 
-            if x.dtype != self.ffn[0].weight.dtype:
-                x = x.to(self.ffn[0].weight.dtype)
+            # Get the appropriate dtype for FFN (avoid FP8)
+            if hasattr(self.ffn[0], 'scale_weight') and self.ffn[0].weight.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
+                target_dtype = self.ffn[0].scale_weight.dtype
+            else:
+                target_dtype = self.ffn[0].weight.dtype
+                
+            if x.dtype != target_dtype:
+                x = x.to(target_dtype)
 
             y = self.ffn(self.norm2(x).float() * (1 + e[4].squeeze(2)) + e[3].squeeze(2))
+            x = x.to(torch.float32)  # Ensure x is in float32 before adding
             x = x + y.to(torch.float32) * e[5].squeeze(2)
-
             del y
 
         return x
@@ -511,18 +549,26 @@ class Head(nn.Module):
         if self.model_version == "2.1":
             e = (self.modulation.to(torch.float32) + e.unsqueeze(1)).chunk(2, dim=1)
             head_input = self.norm(x) * (1 + e[1]) + e[0]
-            # Ensure head input matches head weight dtype
-            if head_input.dtype != self.head.weight.dtype:
-                logger.info(f"SWAP Head: Changing head input dtype from {head_input.dtype} to {self.head.weight.dtype}")
-                head_input = head_input.to(self.head.weight.dtype)
+            # Ensure head input matches head weight dtype (avoid FP8)
+            if hasattr(self.head, 'scale_weight') and self.head.weight.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
+                target_dtype = self.head.scale_weight.dtype
+            else:
+                target_dtype = self.head.weight.dtype
+                
+            if head_input.dtype != target_dtype:
+                head_input = head_input.to(target_dtype)
             x = self.head(head_input)
         else:  # For Wan2.2
             e = (self.modulation.unsqueeze(0).to(torch.float32) + e.unsqueeze(2)).chunk(2, dim=2)
             head_input = self.norm(x) * (1 + e[1].squeeze(2)) + e[0].squeeze(2)
-            # Ensure head input matches head weight dtype
-            if head_input.dtype != self.head.weight.dtype:
-                logger.info(f"SWAP Head: Changing head input dtype from {head_input.dtype} to {self.head.weight.dtype}")
-                head_input = head_input.to(self.head.weight.dtype)
+            # Ensure head input matches head weight dtype (avoid FP8)
+            if hasattr(self.head, 'scale_weight') and self.head.weight.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
+                target_dtype = self.head.scale_weight.dtype
+            else:
+                target_dtype = self.head.weight.dtype
+                
+            if head_input.dtype != target_dtype:
+                head_input = head_input.to(target_dtype)
             x = self.head(head_input)
 
         return x
@@ -853,11 +899,11 @@ class WanModel(nn.Module):  # ModelMixin, ConfigMixin):
 
         # embeddings
         # make sure same type
-        if self.patch_embedding.weight.dtype != x[0].dtype:
-            print(f"SWAP: Changing x[0] dtype from {x[0].dtype} to {self.patch_embedding.weight.dtype}")
-            x = [u.to(self.patch_embedding.weight.dtype) for u in x]
-        
-        x = [self.patch_embedding(u.unsqueeze(0)) for u in x]  # x[0].shape = [1, 5120, F, H, W]
+        # if self.patch_embedding.weight.dtype != x[0].dtype:
+        #     print(f"SWAP: Changing x[0] dtype from {x[0].dtype} to {self.patch_embedding.weight.dtype}")
+        #     x = [u.to(self.patch_embedding.weight.dtype) for u in x]
+        with torch.amp.autocast(device_type=device.type, dtype=torch.float32):
+            x = [self.patch_embedding(u.unsqueeze(0)) for u in x]  # x[0].shape = [1, 5120, F, H, W]
         grid_sizes = torch.stack([torch.tensor(u.shape[2:], dtype=torch.long) for u in x])  # list of [F, H, W]
         freqs_list = []
         for i, fhw in enumerate(grid_sizes):
@@ -893,17 +939,27 @@ class WanModel(nn.Module):  # ModelMixin, ConfigMixin):
         # context
         context_lens = None
         if type(context) is list:
-            if context[0].dtype != self.text_embedding[0].weight.dtype:
-                print(f"SWAP: Changing context dtype from {context[0].dtype} to {self.text_embedding[0].weight.dtype}")
-                context = [u.to(self.text_embedding[0].weight.dtype) for u in context]
+            # Get the appropriate dtype for computation (avoid FP8)
+            if hasattr(self.text_embedding[0], 'scale_weight') and self.text_embedding[0].weight.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
+                target_dtype = self.text_embedding[0].scale_weight.dtype
+            else:
+                target_dtype = self.text_embedding[0].weight.dtype
+                
+            if context[0].dtype != target_dtype:
+                context = [u.to(target_dtype) for u in context]
             context = torch.stack([torch.cat([u, u.new_zeros(self.text_len - u.size(0), u.size(1))]) for u in context])
 
         context = self.text_embedding(context)
 
         if clip_fea is not None:
-            if clip_fea.dtype != self.img_emb.weight.dtype:
-                print(f"SWAP: Changing clip_fea dtype from {clip_fea.dtype} to {self.img_emb.weight.dtype}")
-                clip_fea = clip_fea.to(self.img_emb.weight.dtype)
+            # Get the appropriate dtype for computation (avoid FP8)
+            if hasattr(self.img_emb, 'scale_weight') and self.img_emb.weight.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
+                target_dtype = self.img_emb.scale_weight.dtype
+            else:
+                target_dtype = self.img_emb.weight.dtype
+                
+            if clip_fea.dtype != target_dtype:
+                clip_fea = clip_fea.to(target_dtype)
 
             context_clip = self.img_emb(clip_fea)  # bs x 257 x dim
             context = torch.concat([context_clip, context], dim=1)

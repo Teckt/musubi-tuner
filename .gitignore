@@ -10,3 +10,10 @@ CLAUDE.md
 GEMINI.md
 .claude/
 .gemini/
+*.safetensors
+
+# Environment files
+.env
+
+# User configuration directories (if using relative paths)
+my_custom_configs/

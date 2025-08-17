@@ -4,13 +4,35 @@ import os
 import toml
 from typing import Dict, Any, Optional
 from pathlib import Path
+from dotenv import load_dotenv
 
 class ConfigManager:
     """Manages configuration files for training and dataset setups"""
     
-    def __init__(self, config_dir: str = "configs"):
-        self.config_dir = Path(config_dir)
-        self.config_dir.mkdir(exist_ok=True)
+    def __init__(self, config_dir: Optional[str] = None):
+        # Load environment variables from .env files
+        try:
+            load_dotenv()  # Load from .env
+        except Exception as e:
+            print(f"Warning: Could not load .env files: {e}")
+        
+        # Use config_dir from parameter, environment variable, or default
+        if config_dir is None:
+            config_dir = os.getenv("CONFIG_DIR", "configs")
+            
+        # If CONFIG_DIR is empty string, use default
+        if not config_dir:
+            config_dir = "configs"
+            
+        try:
+            self.config_dir = Path(config_dir).expanduser().resolve()
+            self.config_dir.mkdir(parents=True, exist_ok=True)
+            print(f"ConfigManager: Using config directory: {self.config_dir}")
+        except Exception as e:
+            print(f"Warning: Could not create config directory '{config_dir}': {e}")
+            print("Falling back to default 'configs' directory")
+            self.config_dir = Path("configs")
+            self.config_dir.mkdir(parents=True, exist_ok=True)
         
         # Default configurations
         self.default_train_config = {
