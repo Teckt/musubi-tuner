@@ -102,7 +102,35 @@ class LoRAModule(torch.nn.Module):
         del self.org_module
 
     def forward(self, x):
-        org_forwarded = self.org_forward(x)
+        # Get the correct dtype from the original module's weights
+        # For Linear layers, check the weight parameter
+        if hasattr(self, 'org_forward') and hasattr(self.org_forward, '__self__'):
+            org_module = self.org_forward.__self__
+            if hasattr(org_module, 'weight'):
+                target_dtype = org_module.weight.dtype
+            else:
+                # Fallback to input dtype if original module doesn't have weight
+                target_dtype = x.dtype
+        else:
+            # Fallback to input dtype
+            target_dtype = x.dtype
+            
+        # Convert x to the correct dtype
+        if x.dtype != target_dtype:
+            logger.info(f"SWAP: Changing x dtype from {x.dtype} to {target_dtype}")
+            x_converted = x.to(target_dtype)
+        else:
+            x_converted = x
+            
+        # Ensure LoRA weights match the target dtype
+        if hasattr(self, 'lora_down') and self.lora_down.weight.dtype != target_dtype:
+            logger.info(f"SWAP: Changing LoRA down weight dtype from {self.lora_down.weight.dtype} to {target_dtype}")
+            self.lora_down = self.lora_down.to(target_dtype)
+        if hasattr(self, 'lora_up') and self.lora_up.weight.dtype != target_dtype:
+            logger.info(f"SWAP: Changing LoRA up weight dtype from {self.lora_up.weight.dtype} to {target_dtype}")
+            self.lora_up = self.lora_up.to(target_dtype)
+            
+        org_forwarded = self.org_forward(x_converted)
 
         # module dropout
         if self.module_dropout is not None and self.training:
@@ -110,7 +138,7 @@ class LoRAModule(torch.nn.Module):
                 return org_forwarded
 
         if self.split_dims is None:
-            lx = self.lora_down(x)
+            lx = self.lora_down(x_converted)
 
             # normal dropout
             if self.dropout is not None and self.training:
@@ -134,7 +162,19 @@ class LoRAModule(torch.nn.Module):
 
             return org_forwarded + lx * self.multiplier * scale
         else:
-            lxs = [lora_down(x) for lora_down in self.lora_down]
+            # Ensure LoRA weights match the target dtype for split dims
+            if hasattr(self, 'lora_down') and isinstance(self.lora_down, torch.nn.ModuleList):
+                for i, lora_down in enumerate(self.lora_down):
+                    if lora_down.weight.dtype != target_dtype:
+                        logger.info(f"SWAP: Changing LoRA down {i} weight dtype from {lora_down.weight.dtype} to {target_dtype}")
+                        self.lora_down[i] = lora_down.to(target_dtype)
+            if hasattr(self, 'lora_up') and isinstance(self.lora_up, torch.nn.ModuleList):
+                for i, lora_up in enumerate(self.lora_up):
+                    if lora_up.weight.dtype != target_dtype:
+                        logger.info(f"SWAP: Changing LoRA up {i} weight dtype from {lora_up.weight.dtype} to {target_dtype}")
+                        self.lora_up[i] = lora_up.to(target_dtype)
+                        
+            lxs = [lora_down(x_converted) for lora_down in self.lora_down]
 
             # normal dropout
             if self.dropout is not None and self.training:
@@ -280,17 +320,55 @@ class LoRAInfModule(LoRAModule):
 
     def default_forward(self, x):
         # logger.info(f"default_forward {self.lora_name} {x.size()}")
-        if self.split_dims is None:
-            lx = self.lora_down(x)
-            lx = self.lora_up(lx)
-            return self.org_forward(x) + lx * self.multiplier * self.scale
+        # Get the correct dtype from the original module's weights
+        if hasattr(self, 'org_forward') and hasattr(self.org_forward, '__self__'):
+            org_module = self.org_forward.__self__
+            if hasattr(org_module, 'weight'):
+                target_dtype = org_module.weight.dtype
+            else:
+                target_dtype = x.dtype
         else:
-            lxs = [lora_down(x) for lora_down in self.lora_down]
+            target_dtype = x.dtype
+            
+        # Convert x to the correct dtype
+        if x.dtype != target_dtype:
+            x_converted = x.to(target_dtype)
+        else:
+            x_converted = x
+            
+        # Ensure LoRA weights match the target dtype
+        if hasattr(self, 'lora_down'):
+            if isinstance(self.lora_down, torch.nn.ModuleList):
+                for i, lora_down in enumerate(self.lora_down):
+                    if lora_down.weight.dtype != target_dtype:
+                        self.lora_down[i] = lora_down.to(target_dtype)
+            elif self.lora_down.weight.dtype != target_dtype:
+                self.lora_down = self.lora_down.to(target_dtype)
+                
+        if hasattr(self, 'lora_up'):
+            if isinstance(self.lora_up, torch.nn.ModuleList):
+                for i, lora_up in enumerate(self.lora_up):
+                    if lora_up.weight.dtype != target_dtype:
+                        self.lora_up[i] = lora_up.to(target_dtype)
+            elif self.lora_up.weight.dtype != target_dtype:
+                self.lora_up = self.lora_up.to(target_dtype)
+            
+        if self.split_dims is None:
+            lx = self.lora_down(x_converted)
+            lx = self.lora_up(lx)
+            return self.org_forward(x_converted) + lx * self.multiplier * self.scale
+        else:
+            lxs = [lora_down(x_converted) for lora_down in self.lora_down]
             lxs = [lora_up(lx) for lora_up, lx in zip(self.lora_up, lxs)]
-            return self.org_forward(x) + torch.cat(lxs, dim=-1) * self.multiplier * self.scale
+            return self.org_forward(x_converted) + torch.cat(lxs, dim=-1) * self.multiplier * self.scale
 
     def forward(self, x):
         if not self.enabled:
+            # Get the correct dtype from the original module's weights  
+            if hasattr(self, 'org_forward') and hasattr(self.org_forward, '__self__'):
+                org_module = self.org_forward.__self__
+                if hasattr(org_module, 'weight') and x.dtype != org_module.weight.dtype:
+                    x = x.to(org_module.weight.dtype)
             return self.org_forward(x)
         return self.default_forward(x)
 

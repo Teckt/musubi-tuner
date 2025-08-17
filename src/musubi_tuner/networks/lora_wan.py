@@ -16,6 +16,21 @@ import musubi_tuner.networks.lora as lora
 WAN_TARGET_REPLACE_MODULES = ["WanAttentionBlock"]
 
 
+class WanLoRANetwork(lora.LoRANetwork):
+    """WAN-specific LoRA network with bulk dtype conversion optimization."""
+    
+    def prepare_grad_etc(self, unet):
+        """Override to add bulk dtype conversion for WAN networks."""
+        super().prepare_grad_etc(unet)
+        
+        # Perform bulk dtype conversion to avoid per-layer conversions during training
+        if hasattr(unet, 'dtype') and unet.dtype != torch.float32:
+            target_dtype = unet.dtype
+            logger.info(f"SWAP: Converting LoRA network to dtype {target_dtype} to avoid per-layer conversions")
+            self.to(target_dtype)
+            logger.info(f"SWAP: LoRA network conversion to {target_dtype} completed")
+
+
 def create_arch_network(
     multiplier: float,
     network_dim: Optional[int],
@@ -38,7 +53,8 @@ def create_arch_network(
 
     kwargs["exclude_patterns"] = exclude_patterns
 
-    return lora.create_network(
+    # Create the base network first
+    base_network = lora.create_network(
         WAN_TARGET_REPLACE_MODULES,
         "lora_unet",
         multiplier,
@@ -50,6 +66,32 @@ def create_arch_network(
         neuron_dropout=neuron_dropout,
         **kwargs,
     )
+    
+    # Create our custom WAN network with the same parameters
+    wan_network = WanLoRANetwork(
+        WAN_TARGET_REPLACE_MODULES,
+        "lora_unet",
+        text_encoders,
+        unet,
+        multiplier=multiplier,
+        lora_dim=network_dim,
+        alpha=network_alpha,
+        dropout=neuron_dropout,
+        rank_dropout=kwargs.get("rank_dropout", None),
+        module_dropout=kwargs.get("module_dropout", None),
+        conv_lora_dim=kwargs.get("conv_dim", None),
+        conv_alpha=kwargs.get("conv_alpha", None),
+        exclude_patterns=exclude_patterns,
+        include_patterns=kwargs.get("include_patterns", None),
+        verbose=kwargs.get("verbose", False),
+    )
+    
+    # Set LoRA+ ratio if specified
+    loraplus_lr_ratio = kwargs.get("loraplus_lr_ratio", None)
+    if loraplus_lr_ratio is not None:
+        wan_network.set_loraplus_lr_ratio(float(loraplus_lr_ratio))
+    
+    return wan_network
 
 
 def create_arch_network_from_weights(

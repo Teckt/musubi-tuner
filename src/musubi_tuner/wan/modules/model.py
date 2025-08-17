@@ -4,6 +4,7 @@ from typing import Dict, List, Optional, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 from accelerate import init_empty_weights
 
@@ -174,7 +175,26 @@ class WanLayerNorm(nn.LayerNorm):
         Args:
             x(Tensor): Shape [B, L, C]
         """
-        return super().forward(x.float()).type_as(x)
+        # Store original dtype
+        original_dtype = x.dtype
+        
+        # Convert to float32 for layer norm computation
+        x_float = x.float()
+        
+        # Manually implement layer norm to avoid PyTorch's internal dtype checks
+        if self.elementwise_affine:
+            # If we have learnable parameters, convert them to float32 as well
+            weight_float = self.weight.float() if self.weight is not None else None
+            bias_float = self.bias.float() if self.bias is not None else None
+            normalized = F.layer_norm(x_float, self.normalized_shape, weight_float, bias_float, self.eps)
+        else:
+            # Manual layer norm without learnable parameters
+            mean = x_float.mean(dim=-1, keepdim=True)
+            var = x_float.var(dim=-1, keepdim=True, unbiased=False)
+            normalized = (x_float - mean) / torch.sqrt(var + self.eps)
+        
+        # Convert back to original dtype
+        return normalized.to(original_dtype)
 
 
 class WanSelfAttention(nn.Module):
@@ -219,6 +239,8 @@ class WanSelfAttention(nn.Module):
         # del x
         # query, key, value function
 
+        if x.dtype != self.q.weight.dtype:
+            x = x.to(self.q.weight.dtype)
         q = self.q(x)
         k = self.k(x)
         v = self.v(x)
@@ -239,6 +261,8 @@ class WanSelfAttention(nn.Module):
 
         # output
         x = x.flatten(2)
+        if x.dtype != self.o.weight.dtype:
+            x = x.to(self.o.weight.dtype)
         x = self.o(x)
         return x
 
@@ -258,6 +282,9 @@ class WanCrossAttention(WanSelfAttention):
         # q = self.norm_q(self.q(x)).view(b, -1, n, d)
         # k = self.norm_k(self.k(context)).view(b, -1, n, d)
         # v = self.v(context).view(b, -1, n, d)
+        if x.dtype != self.q.weight.dtype:
+            x = x.to(self.q.weight.dtype)
+
         q = self.q(x)
         del x
         k = self.k(context)
@@ -428,13 +455,21 @@ class WanAttentionBlock(nn.Module):
             assert e[0].dtype == torch.float32
 
             # self-attention
+            if x.dtype != self.self_attn.q.weight.dtype:
+                x = x.to(self.self_attn.q.weight.dtype)
             y = self.self_attn(self.norm1(x).float() * (1 + e[1].squeeze(2)) + e[0].squeeze(2), seq_lens, grid_sizes, freqs)
             x = x + y.to(torch.float32) * e[2].squeeze(2)
             del y
 
             # cross-attention & ffn
+            if x.dtype != self.cross_attn.q.weight.dtype:
+                x = x.to(self.cross_attn.q.weight.dtype)
             x = x + self.cross_attn(self.norm3(x), context, context_lens)
             del context
+
+            if x.dtype != self.ffn[0].weight.dtype:
+                x = x.to(self.ffn[0].weight.dtype)
+
             y = self.ffn(self.norm2(x).float() * (1 + e[4].squeeze(2)) + e[3].squeeze(2))
             x = x + y.to(torch.float32) * e[5].squeeze(2)
 
@@ -475,10 +510,20 @@ class Head(nn.Module):
         assert e.dtype == torch.float32
         if self.model_version == "2.1":
             e = (self.modulation.to(torch.float32) + e.unsqueeze(1)).chunk(2, dim=1)
-            x = self.head(self.norm(x) * (1 + e[1]) + e[0])
+            head_input = self.norm(x) * (1 + e[1]) + e[0]
+            # Ensure head input matches head weight dtype
+            if head_input.dtype != self.head.weight.dtype:
+                logger.info(f"SWAP Head: Changing head input dtype from {head_input.dtype} to {self.head.weight.dtype}")
+                head_input = head_input.to(self.head.weight.dtype)
+            x = self.head(head_input)
         else:  # For Wan2.2
             e = (self.modulation.unsqueeze(0).to(torch.float32) + e.unsqueeze(2)).chunk(2, dim=2)
-            x = self.head(self.norm(x) * (1 + e[1].squeeze(2)) + e[0].squeeze(2))
+            head_input = self.norm(x) * (1 + e[1].squeeze(2)) + e[0].squeeze(2)
+            # Ensure head input matches head weight dtype
+            if head_input.dtype != self.head.weight.dtype:
+                logger.info(f"SWAP Head: Changing head input dtype from {head_input.dtype} to {self.head.weight.dtype}")
+                head_input = head_input.to(self.head.weight.dtype)
+            x = self.head(head_input)
 
         return x
 
@@ -618,6 +663,7 @@ class WanModel(nn.Module):  # ModelMixin, ConfigMixin):
 
         # embeddings
         self.patch_embedding = nn.Conv3d(in_dim, dim, kernel_size=patch_size, stride=patch_size)
+        print(f"WanModel: Patch embedding args: in_dim={in_dim}, dim={dim}, patch_size={patch_size}")
         self.text_embedding = nn.Sequential(nn.Linear(text_dim, dim), nn.GELU(approximate="tanh"), nn.Linear(dim, dim))
 
         self.time_embedding = nn.Sequential(nn.Linear(freq_dim, dim), nn.SiLU(), nn.Linear(dim, dim))
@@ -729,34 +775,43 @@ class WanModel(nn.Module):  # ModelMixin, ConfigMixin):
         print(
             f"WanModel: Block swap enabled. Swapping {self.blocks_to_swap} blocks out of {self.num_blocks} blocks. Supports backward: {supports_backward}"
         )
+        print(f"SWAP: WAN model block swap configuration - {self.blocks_to_swap}/{self.num_blocks} blocks will be swapped to CPU")
 
     def switch_block_swap_for_inference(self):
         if self.blocks_to_swap:
+            print(f"SWAP: WAN model switching to inference mode (forward-only swapping)")
             self.offloader.set_forward_only(True)
             self.prepare_block_swap_before_forward()
             print(f"WanModel: Block swap set to forward only.")
 
     def switch_block_swap_for_training(self):
         if self.blocks_to_swap:
+            print(f"SWAP: WAN model switching to training mode (forward+backward swapping)")
             self.offloader.set_forward_only(False)
             self.prepare_block_swap_before_forward()
             print(f"WanModel: Block swap set to forward and backward.")
 
     def move_to_device_except_swap_blocks(self, device: torch.device):
         # assume model is on cpu. do not move blocks to device to reduce temporary memory usage
+        print(f"SWAP: WAN model moving to {device} except swap blocks...")
         if self.blocks_to_swap:
+            print(f"SWAP: Temporarily removing {len(self.blocks)} blocks during model move")
             save_blocks = self.blocks
             self.blocks = None
 
         self.to(device)
+        print(f"SWAP: WAN model main structure moved to {device}")
 
         if self.blocks_to_swap:
+            print(f"SWAP: Restoring {len(save_blocks)} blocks after model move")
             self.blocks = save_blocks
 
     def prepare_block_swap_before_forward(self):
         if self.blocks_to_swap is None or self.blocks_to_swap == 0:
             return
+        print(f"SWAP: WAN model preparing block swap before forward pass...")
         self.offloader.prepare_block_devices_before_forward(self.blocks)
+        print(f"SWAP: WAN model block swap preparation completed")
 
     def forward(self, x, t, context, seq_len, clip_fea=None, y=None, skip_block_indices=None, f_indices=None):
         r"""
@@ -797,9 +852,13 @@ class WanModel(nn.Module):  # ModelMixin, ConfigMixin):
             y = None
 
         # embeddings
+        # make sure same type
+        if self.patch_embedding.weight.dtype != x[0].dtype:
+            print(f"SWAP: Changing x[0] dtype from {x[0].dtype} to {self.patch_embedding.weight.dtype}")
+            x = [u.to(self.patch_embedding.weight.dtype) for u in x]
+        
         x = [self.patch_embedding(u.unsqueeze(0)) for u in x]  # x[0].shape = [1, 5120, F, H, W]
         grid_sizes = torch.stack([torch.tensor(u.shape[2:], dtype=torch.long) for u in x])  # list of [F, H, W]
-
         freqs_list = []
         for i, fhw in enumerate(grid_sizes):
             fhw = tuple(fhw.tolist())
@@ -834,10 +893,18 @@ class WanModel(nn.Module):  # ModelMixin, ConfigMixin):
         # context
         context_lens = None
         if type(context) is list:
+            if context[0].dtype != self.text_embedding[0].weight.dtype:
+                print(f"SWAP: Changing context dtype from {context[0].dtype} to {self.text_embedding[0].weight.dtype}")
+                context = [u.to(self.text_embedding[0].weight.dtype) for u in context]
             context = torch.stack([torch.cat([u, u.new_zeros(self.text_len - u.size(0), u.size(1))]) for u in context])
+
         context = self.text_embedding(context)
 
         if clip_fea is not None:
+            if clip_fea.dtype != self.img_emb.weight.dtype:
+                print(f"SWAP: Changing clip_fea dtype from {clip_fea.dtype} to {self.img_emb.weight.dtype}")
+                clip_fea = clip_fea.to(self.img_emb.weight.dtype)
+
             context_clip = self.img_emb(clip_fea)  # bs x 257 x dim
             context = torch.concat([context_clip, context], dim=1)
             clip_fea = None

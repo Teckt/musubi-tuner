@@ -25,6 +25,7 @@ from musubi_tuner.wan_generate_video import parse_one_frame_inference_args
 import logging
 
 logger = logging.getLogger(__name__)
+swap_logger = logging.getLogger("musubi_tuner.modules.custom_offloading_utils")
 logging.basicConfig(level=logging.INFO)
 
 from musubi_tuner.utils import model_utils
@@ -155,7 +156,7 @@ class WanNetworkTrainer(NetworkTrainer):
 
         if len(sample_prompts_image_embs) > 0 and not self.config.v2_2:  # Wan2.2 does not use CLIP for I2V training
             logger.info(f"loading CLIP: {clip_path}")
-            assert clip_path is not None, "CLIP path is required for I2V training / I2V学習にはCLIPのパスが必要です"
+            assert clip_path is not None, "CLIP path is required for I2V training"
             clip = CLIPModel(dtype=config.clip_dtype, device=device, weight_path=clip_path)
             clip.model.to(device)
 
@@ -269,6 +270,7 @@ class WanNetworkTrainer(NetworkTrainer):
             logger.info(
                 f"One frame inference mode: target_index={target_index}, control_indices={control_indices}, f_indices={f_indices}"
             )
+            print(f"SWAP: Moving VAE to {device} for one-frame inference...")
             vae.to(device)
             vae.eval()
 
@@ -311,11 +313,13 @@ class WanNetworkTrainer(NetworkTrainer):
                     ci += 1
             image_latents = image_latents.unsqueeze(0)  # add batch dim
 
+            print(f"SWAP: Moving VAE to CPU after one-frame encoding...")
             vae.to("cpu")
             clean_memory_on_device(device)
 
         elif self.i2v_training or self.control_training:
             # Move VAE to the appropriate device for sampling: consider to cache image latents in CPU in advance
+            print(f"SWAP: Moving VAE to {device} for I2V/control training...")
             vae.to(device)
             vae.eval()
 
@@ -364,6 +368,7 @@ class WanNetworkTrainer(NetworkTrainer):
 
                 image_latents = torch.concat([control_latents, image_latents], dim=1)  # B, C, F, H, W
 
+            print(f"SWAP: Moving VAE to CPU after I2V/control encoding...")
             vae.to("cpu")
             clean_memory_on_device(device)
 
@@ -429,6 +434,7 @@ class WanNetworkTrainer(NetworkTrainer):
                 latent = temp_x0.squeeze(0)
 
         # Move VAE to the appropriate device for sampling
+        print(f"SWAP: Moving VAE to {device} for final decoding...")
         vae.to(device)
         vae.eval()
 
@@ -448,6 +454,7 @@ class WanNetworkTrainer(NetworkTrainer):
         video = video.to(torch.float32).cpu()
         video = (video / 2 + 0.5).clamp(0, 1)  # -1 to 1 -> 0 to 1
 
+        print(f"SWAP: Moving VAE to CPU after final decoding...")
         vae.to("cpu")
         clean_memory_on_device(device)
 
@@ -474,6 +481,13 @@ class WanNetworkTrainer(NetworkTrainer):
         model = load_wan_model(
             self.config, accelerator.device, dit_path, attn_mode, split_attn, loading_device, dit_weight_dtype, args.fp8_scaled
         )
+        
+        # Bulk convert model weights to avoid per-layer conversions during training
+        if dit_weight_dtype is not None and not args.fp8_scaled:
+            logger.info(f"SWAP: Converting entire model to dtype {dit_weight_dtype} to avoid per-layer conversions")
+            model = model.to(dit_weight_dtype)
+            logger.info(f"SWAP: Model conversion to {dit_weight_dtype} completed")
+        
         if self.high_low_training:
             # load high noise model
             logger.info(f"Loading high noise model from {self.dit_high_noise_path}")
@@ -487,6 +501,13 @@ class WanNetworkTrainer(NetworkTrainer):
                 dit_weight_dtype,
                 args.fp8_scaled,
             )
+            
+            # Bulk convert high noise model weights to avoid per-layer conversions during training
+            if dit_weight_dtype is not None and not args.fp8_scaled:
+                logger.info(f"SWAP: Converting high noise model to dtype {dit_weight_dtype} to avoid per-layer conversions")
+                model_high_noise = model_high_noise.to(dit_weight_dtype)
+                logger.info(f"SWAP: High noise model conversion to {dit_weight_dtype} completed")
+            
             if self.blocks_to_swap > 0:
                 # This moves the weights to the appropriate device
                 logger.info(f"Prepare block swap for high noise model, blocks_to_swap={self.blocks_to_swap}")
@@ -671,6 +692,15 @@ class WanNetworkTrainer(NetworkTrainer):
         seq_len = lat_f * lat_h * lat_w // (self.config.patch_size[0] * self.config.patch_size[1] * self.config.patch_size[2])
         latents = latents.to(device=accelerator.device, dtype=network_dtype)
         noisy_model_input = noisy_model_input.to(device=accelerator.device, dtype=network_dtype)
+        
+        # print image shape if not none
+        if image_latents is not None:
+            print(f"Calling DiT model with latents shape: {latents.shape}, noisy_model_input shape: {noisy_model_input.shape}, image_latents shape: {image_latents.shape}")
+        else:
+            print(f"Calling DiT model with latents shape: {latents.shape}, noisy_model_input shape: {noisy_model_input.shape}")
+        if clip_fea is not None:
+            print(f"Calling DiT model with clip_fea shape: {clip_fea.shape}")
+
         with accelerator.autocast():
             model_pred = model(noisy_model_input, t=timesteps, context=context, clip_fea=clip_fea, seq_len=seq_len, y=image_latents)
         model_pred = torch.stack(model_pred, dim=0)  # list to tensor
@@ -704,12 +734,17 @@ def wan_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser
         "--timestep_boundary",
         type=int,
         default=None,
-        help="Timestep boundary for switching between high and low noise models, defaults to None (task specific) / 高ノイズモデルと低ノイズモデルを切り替えるタイムステップ境界。デフォルトはNone（タスク固有）",
+        help="Timestep boundary for switching between high and low noise models, defaults to None (task specific)",
     )
     parser.add_argument(
         "--offload_inactive_dit",
         action="store_true",
-        help="Offload inactive DiT model to CPU. Cannot be used with block swap / アクティブではないDiTモデルをCPUにオフロードします。ブロックスワップと併用できません",
+        help="Offload inactive DiT model to CPU. Cannot be used with block swap",
+    )
+    parser.add_argument(
+        "--debug_swapping",
+        action="store_true",
+        help="Enable detailed logging of model swapping operations",
     )
 
     return parser
@@ -725,6 +760,13 @@ def main():
     args.dit_dtype = None  # automatically detected
     if args.vae_dtype is None:
         args.vae_dtype = "bfloat16"  # make bfloat16 as default for VAE
+
+    # Enable detailed swap logging if requested
+    if args.debug_swapping:
+        swap_logger.setLevel(logging.INFO)
+        logger.info("Detailed model swapping logging enabled")
+    else:
+        swap_logger.setLevel(logging.WARNING)
 
     trainer = WanNetworkTrainer()
     trainer.train(args)

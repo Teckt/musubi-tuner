@@ -685,6 +685,12 @@ class MusubiTrainerUI:
                     value=False,
                     info="Log training configuration"
                 )
+                
+                debug_swapping = gr.Checkbox(
+                    label="Debug Model Swapping",
+                    value=False,
+                    info="Enable detailed logging of model swapping operations (CPU/GPU transfers)"
+                )
         
         return {
             "learning_rate": learning_rate,
@@ -718,7 +724,8 @@ class MusubiTrainerUI:
             "log_with": log_with,
             "wandb_api_key": wandb_api_key,
             "wandb_run_name": wandb_run_name,
-            "log_config": log_config
+            "log_config": log_config,
+            "debug_swapping": debug_swapping
         }
     
     def create_config_management_ui(self):
@@ -948,6 +955,9 @@ class MusubiTrainerUI:
             
             if training_config["log_config"]:
                 cmd.append("--log_config")
+            
+            if training_config["debug_swapping"]:
+                cmd.append("--debug_swapping")
             
             return " ".join(cmd)
             
@@ -1527,7 +1537,7 @@ class MusubiTrainerUI:
                 "frame_extraction", "frame_stride", "frame_sample", "max_frames", "source_fps",
                 "video_num_repeats", "toml_output_path",
                 
-                # Training components (22 components)
+                # Training components (23 components)
                 "learning_rate", "optimizer_type", "network_dim", "network_alpha",
                 "max_train_epochs", "save_every_n_epochs", "batch_size", "seed",
                 "timestep_sampling", "discrete_flow_shift", "min_timestep", "max_timestep",
@@ -1536,6 +1546,7 @@ class MusubiTrainerUI:
                 "max_data_loader_n_workers", "persistent_data_loader_workers", "attention_mode",
                 "split_attn", "output_dir", "output_name", "dataset_config_path",
                 "logging_dir", "log_with", "wandb_api_key", "wandb_run_name", "log_config",
+                "debug_swapping",
                 
                 # Execution components (1 component)
                 "text_encoder_batch_size"
@@ -1618,7 +1629,8 @@ class MusubiTrainerUI:
                     "log_with": values.get("log_with", ""),
                     "wandb_api_key": values.get("wandb_api_key", ""),
                     "wandb_run_name": values.get("wandb_run_name", ""),
-                    "log_config": values.get("log_config", False)
+                    "log_config": values.get("log_config", False),
+                    "debug_swapping": values.get("debug_swapping", False)
                 },
                 "execution": {
                     "text_encoder_batch_size": values.get("text_encoder_batch_size", 16)
@@ -1731,7 +1743,7 @@ class MusubiTrainerUI:
             updates.append(gr.update(value=dataset_config.get("video_num_repeats", 1)))
             updates.append(gr.update(value=dataset_config.get("toml_output_path", "dataset_config.toml")))
             
-            # Training components (22 components)
+            # Training components (23 components)
             updates.append(gr.update(value=training_config.get("learning_rate", 2e-4)))
             updates.append(gr.update(value=training_config.get("optimizer_type", "adamw8bit")))
             updates.append(gr.update(value=training_config.get("network_dim", 32)))
@@ -1764,11 +1776,12 @@ class MusubiTrainerUI:
             updates.append(gr.update(value=training_config.get("wandb_api_key", "")))
             updates.append(gr.update(value=training_config.get("wandb_run_name", "")))
             updates.append(gr.update(value=training_config.get("log_config", False)))
+            updates.append(gr.update(value=training_config.get("debug_swapping", False)))
             
             # Execution components (1 component)
             updates.append(gr.update(value=execution_config.get("text_encoder_batch_size", 16)))
             
-            print(f"DEBUG: Generated {len(updates)} component updates (expected 51: 9 model + 19 dataset + 22 training + 1 execution)")
+            print(f"DEBUG: Generated {len(updates)} component updates (expected 52: 9 model + 19 dataset + 23 training + 1 execution)")
             return updates
             
         except Exception as e:
