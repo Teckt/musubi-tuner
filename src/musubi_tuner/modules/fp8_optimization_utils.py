@@ -330,6 +330,10 @@ def fp8_linear_forward_patch(self: nn.Linear, x, use_scaled_mm=False, max_value=
         original_dtype = self.scale_weight.dtype
         dequantized_weight = self.weight.to(original_dtype) * self.scale_weight
 
+        # Ensure input tensor matches the dequantized weight dtype
+        if x.dtype != original_dtype:
+            x = x.to(original_dtype)
+
         # Perform linear transformation
         if self.bias is not None:
             output = F.linear(x, dequantized_weight, self.bias)

@@ -110,6 +110,8 @@ class LoRAModule(torch.nn.Module):
                 return org_forwarded
 
         if self.split_dims is None:
+            if x.dtype != self.lora_down.weight.dtype:
+                x = x.to(self.lora_down.weight.dtype)
             lx = self.lora_down(x)
 
             # normal dropout
@@ -134,6 +136,8 @@ class LoRAModule(torch.nn.Module):
 
             return org_forwarded + lx * self.multiplier * scale
         else:
+            if x.dtype != self.lora_down[0].weight.dtype:
+                x = x.to(self.lora_down[0].weight.dtype)
             lxs = [lora_down(x) for lora_down in self.lora_down]
 
             # normal dropout

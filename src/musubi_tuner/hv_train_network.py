@@ -951,7 +951,7 @@ class NetworkTrainer:
                         break
                 if len(available_t) < batch_size:
                     logger.warning(
-                        f"Could not sample {batch_size} valid timesteps in {max_loops} loops / {max_loops}ループで{batch_size}個の有効なタイムステップをサンプリングできませんでした"
+                        f"Could not sample {batch_size} valid timesteps in {max_loops} loops"
                     )
                     available_t = compute_sampling_timesteps(timesteps)
                 else:
@@ -1075,7 +1075,7 @@ class NetworkTrainer:
             return
 
         logger.info("")
-        logger.info(f"generating sample images at step / サンプル画像生成 ステップ: {steps}")
+        logger.info(f"generating sample images at step: {steps}")
         if sample_parameters is None:
             logger.error(f"No prompt file / プロンプトファイルがありません: {args.sample_prompts}")
             return
@@ -1150,7 +1150,7 @@ class NetworkTrainer:
         if self.i2v_training:
             image_path = sample_parameter.get("image_path", None)
             if image_path is None:
-                logger.error("No image_path for i2v model / i2vモデルのサンプル画像生成にはimage_pathが必要です")
+                logger.error("No image_path for i2v model")
                 return
         else:
             image_path = None
@@ -1159,7 +1159,7 @@ class NetworkTrainer:
             control_video_path = sample_parameter.get("control_video_path", None)
             if control_video_path is None:
                 logger.error(
-                    "No control_video_path for control model / controlモデルのサンプル画像生成にはcontrol_video_pathが必要です"
+                    "No control_video_path for control model"
                 )
                 return
         else:
@@ -1220,7 +1220,7 @@ class NetworkTrainer:
 
         # Save video
         if video is None:
-            logger.error("No video generated / 生成された動画がありません")
+            logger.error("No video generated")
             return
 
         ts_str = time.strftime("%Y%m%d%H%M%S", time.localtime())
@@ -1618,7 +1618,6 @@ class NetworkTrainer:
         if args.sage_attn:
             raise ValueError(
                 "SageAttention doesn't support training currently. Please use `--sdpa` or `--xformers` etc. instead."
-                " / SageAttentionは現在学習をサポートしていないようです。`--sdpa`や`--xformers`などの他のオプションを使ってください"
             )
 
         # check model specific arguments
@@ -1651,7 +1650,7 @@ class NetworkTrainer:
         )
 
         if train_dataset_group.num_train_items == 0:
-            raise ValueError("No training items found in the dataset / データセットに学習データがありません")
+            raise ValueError("No training items found in the dataset")
 
         current_epoch = Value("i", 0)
         current_step = Value("i", 0)
@@ -1822,7 +1821,7 @@ class NetworkTrainer:
                 len(train_dataloader) / accelerator.num_processes / args.gradient_accumulation_steps
             )
             accelerator.print(
-                f"override steps. steps for {args.max_train_epochs} epochs is / 指定エポックまでのステップ数: {args.max_train_steps}"
+                f"override steps. steps for {args.max_train_epochs} epochs is: {args.max_train_steps}"
             )
 
         # send max_train_steps to train_dataset_group
@@ -1916,19 +1915,19 @@ class NetworkTrainer:
         num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
         num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
 
-        # 学習する
+        # train the model
         # total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
 
-        accelerator.print("running training / 学習開始")
-        accelerator.print(f"  num train items / 学習画像、動画数: {train_dataset_group.num_train_items}")
-        accelerator.print(f"  num batches per epoch / 1epochのバッチ数: {len(train_dataloader)}")
-        accelerator.print(f"  num epochs / epoch数: {num_train_epochs}")
+        accelerator.print("running training")
+        accelerator.print(f"  num train items: {train_dataset_group.num_train_items}")
+        accelerator.print(f"  num batches per epoch: {len(train_dataloader)}")
+        accelerator.print(f"  num epochs: {num_train_epochs}")
         accelerator.print(
-            f"  batch size per device / バッチサイズ: {', '.join([str(d.batch_size) for d in train_dataset_group.datasets])}"
+            f"  batch size per device: {', '.join([str(d.batch_size) for d in train_dataset_group.datasets])}"
         )
-        # accelerator.print(f"  total train batch size (with parallel & distributed & accumulation) / 総バッチサイズ（並列学習、勾配合計含む）: {total_batch_size}")
-        accelerator.print(f"  gradient accumulation steps / 勾配を合計するステップ数 = {args.gradient_accumulation_steps}")
-        accelerator.print(f"  total optimization steps / 学習ステップ数: {args.max_train_steps}")
+        # accelerator.print(f"  total train batch size (with parallel & distributed & accumulation): {total_batch_size}")
+        accelerator.print(f"  gradient accumulation steps: {args.gradient_accumulation_steps}")
+        accelerator.print(f"  total optimization steps: {args.max_train_steps}")
 
         # TODO refactor metadata creation and move to util
         metadata = {
@@ -2133,6 +2132,9 @@ class NetworkTrainer:
                     model_pred, target = self.call_dit(
                         args, accelerator, transformer, latents, batch, noise, noisy_model_input, timesteps, network_dtype
                     )
+
+                    print(f"Model prediction dtype: {model_pred.dtype}, target dtype: {target.dtype}, network dtype: {network_dtype}")
+
                     loss = torch.nn.functional.mse_loss(model_pred.to(network_dtype), target, reduction="none")
 
                     if weighting is not None:
