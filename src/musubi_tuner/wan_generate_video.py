@@ -1741,7 +1741,7 @@ def save_output(
         original_name = "" if original_base_names is None else f"_{original_base_names[0]}"
         save_video(sample, args, original_name)
 
-    elif args.output_type == "images":
+    elif args.output_type == "images" or args.output_type == "latent_images":
         # save images
         sample = decode_latent(latent.unsqueeze(0), args, cfg)
         original_name = "" if original_base_names is None else f"_{original_base_names[0]}"
@@ -1937,7 +1937,7 @@ def process_batch_prompts(prompts_data: List[Dict], args: argparse.Namespace) ->
             # Save as video or images
             if prompt_args.output_type == "video" or prompt_args.output_type == "both":
                 save_video(video, prompt_args)
-            elif prompt_args.output_type == "images":
+            elif prompt_args.output_type == "images" or prompt_args.output_type == "latent_images":
                 save_images(video, prompt_args)
 
         # Free VAE
@@ -2117,7 +2117,7 @@ def process_interactive(args: argparse.Namespace) -> None:
 
                     if prompt_args.output_type == "video" or prompt_args.output_type == "both":
                         save_video(video, prompt_args)
-                    elif prompt_args.output_type == "images":
+                    elif prompt_args.output_type == "images" or prompt_args.output_type == "latent_images":
                         save_images(video, prompt_args)
 
                     # Move VAE to CPU after use

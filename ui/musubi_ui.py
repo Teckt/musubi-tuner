@@ -9,6 +9,7 @@ Features:
 - Config save/load functionality
 - Training command generation and execution
 - Caption generation for training datasets
+- Image/Video inference with LoRA support
 """
 
 import gradio as gr
@@ -39,6 +40,11 @@ class MusubiTrainerUI:
         self.training_process = None
         self.training_thread = None
         self.is_training = False
+        
+        # Inference process state
+        self.inference_process = None
+        self.inference_thread = None
+        self.is_inference_running = False
         
         # Caption generation setup
         self.caption_model = None
@@ -77,6 +83,19 @@ class MusubiTrainerUI:
                     pass
             self.is_training = False
             self.training_process = None
+        
+        if self.is_inference_running and self.inference_process:
+            print("DEBUG: Cleaning up inference process...")
+            try:
+                self.inference_process.terminate()
+                self.inference_process.wait(timeout=5)
+            except:
+                try:
+                    self.inference_process.kill()
+                except:
+                    pass
+            self.is_inference_running = False
+            self.inference_process = None
         
     def create_model_config_ui(self):
         """Create model configuration UI"""
@@ -768,6 +787,672 @@ class MusubiTrainerUI:
             "config_status": config_status
         }
     
+    def create_inference_ui(self):
+        """Create comprehensive inference UI for I2V and video generation with WAN 2.1/2.2 support"""
+        with gr.Group():
+            gr.Markdown("## Inference Configuration")
+            gr.Markdown("Generate images/videos using trained LoRA models with WAN 2.1/2.2")
+            
+            with gr.Tabs():
+                # I2V One Frame Inference Tab
+                with gr.TabItem("I2V (1-Frame Inference)"):
+                    gr.Markdown("""
+                    ### Image-to-Video Single Frame Inference
+                    
+                    **Note**: 1-frame inference requires a trained LoRA model. This feature is experimental.
+                    
+                    **Usage**: Input a starting image and prompt to generate a single transformed frame.
+                    The generated image will show temporal/semantic changes based on your prompt.
+                    """)
+                    
+                    with gr.Row():
+                        with gr.Column():
+                            # Model Configuration
+                            gr.Markdown("#### Model Configuration")
+                            
+                            i2v_wan_version = gr.Dropdown(
+                                choices=[("WAN 2.1", "2.1"), ("WAN 2.2", "2.2")],
+                                value="2.1",
+                                label="WAN Version",
+                                info="Select WAN model version"
+                            )
+                            
+                            i2v_task = gr.Dropdown(
+                                choices=[("I2V 14B", "i2v-14B"), ("I2V A14B (WAN 2.2)", "i2v-A14B")],
+                                value="i2v-14B",
+                                label="Task",
+                                info="Use I2V 14B model for 1-frame inference"
+                            )
+                            
+                            i2v_dit_path = gr.Textbox(
+                                label="DiT Model Path *",
+                                placeholder="path/to/wan2.x_i2v_model.safetensors",
+                                info="I2V DiT model weights (required)"
+                            )
+                            
+                            i2v_dit_high_noise_path = gr.Textbox(
+                                label="DiT High Noise Path (WAN 2.2)",
+                                placeholder="path/to/wan2.2_i2v_high_noise_model.safetensors",
+                                info="High noise DiT model for WAN 2.2",
+                                visible=False
+                            )
+                            
+                            i2v_vae_path = gr.Textbox(
+                                label="VAE Model Path *", 
+                                placeholder="path/to/wan_2.1_vae.safetensors",
+                                info="VAE model for encoding/decoding (required)"
+                            )
+                            
+                            i2v_t5_path = gr.Textbox(
+                                label="T5 Text Encoder Path *",
+                                placeholder="path/to/models_t5_umt5-xxl-enc-bf16.pth",
+                                info="T5 text encoder model (required)"
+                            )
+                            
+                            i2v_clip_path = gr.Textbox(
+                                label="CLIP Model Path (WAN 2.1 only)",
+                                placeholder="path/to/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth",
+                                info="CLIP model required for WAN 2.1"
+                            )
+                            
+                            i2v_lora_path = gr.Textbox(
+                                label="LoRA Model Path",
+                                placeholder="path/to/lora_model.safetensors",
+                                info="Optional but recommended: Trained LoRA model for better 1-frame inference quality"
+                            )
+                            
+                            i2v_lora_multiplier = gr.Slider(
+                                minimum=0.0,
+                                maximum=2.0,
+                                value=1.0,
+                                step=0.1,
+                                label="LoRA Multiplier",
+                                info="Strength of LoRA effects"
+                            )
+                        
+                        with gr.Column():
+                            # Inference Configuration
+                            gr.Markdown("#### Inference Settings")
+                            i2v_input_image = gr.Image(
+                                label="Input Image *",
+                                type="filepath",
+                                # info="Starting image for transformation (required)"
+                            )
+                            
+                            i2v_prompt = gr.Textbox(
+                                label="Prompt *",
+                                placeholder="A cat wearing sunglasses",
+                                lines=3,
+                                info="Describe the desired transformation (required)"
+                            )
+                            
+                            i2v_negative_prompt = gr.Textbox(
+                                label="Negative Prompt",
+                                placeholder="blurry, low quality, distorted",
+                                lines=2,
+                                value="blurry, low quality, distorted",
+                                info="What to avoid in generation"
+                            )
+                            
+                            with gr.Row():
+                                i2v_width = gr.Number(
+                                    value=384,
+                                    label="Width",
+                                    info="Output image width"
+                                )
+                                i2v_height = gr.Number(
+                                    value=576,
+                                    label="Height", 
+                                    info="Output image height"
+                                )
+                            
+                            with gr.Row():
+                                i2v_steps = gr.Slider(
+                                    minimum=10,
+                                    maximum=50,
+                                    value=25,
+                                    step=1,
+                                    label="Inference Steps",
+                                    info="Number of denoising steps"
+                                )
+                                i2v_guidance_scale = gr.Slider(
+                                    minimum=1.0,
+                                    maximum=20.0,
+                                    value=7.0,
+                                    step=0.5,
+                                    label="Guidance Scale",
+                                    info="Adherence to prompt"
+                                )
+                            
+                            with gr.Row():
+                                i2v_target_index = gr.Number(
+                                    value=1,
+                                    label="Target Index",
+                                    info="RoPE timestamp for generated frame (>=1)"
+                                )
+                                i2v_control_index = gr.Number(
+                                    value=0,
+                                    label="Control Index", 
+                                    info="RoPE timestamp for control frame (usually 0)"
+                                )
+                            
+                            i2v_seed = gr.Number(
+                                value=-1,
+                                label="Seed",
+                                info="Random seed (-1 for random)"
+                            )
+                
+                # Standard Video Generation Tab  
+                with gr.TabItem("Video Generation"):
+                    gr.Markdown("""
+                    ### Standard Video Generation
+                    
+                    Generate videos using Text-to-Video or Image-to-Video models.
+                    """)
+                    
+                    with gr.Row():
+                        with gr.Column():
+                            # Model Configuration
+                            gr.Markdown("#### Model Configuration")
+                            
+                            video_wan_version = gr.Dropdown(
+                                choices=[("WAN 2.1", "2.1"), ("WAN 2.2", "2.2")],
+                                value="2.1",
+                                label="WAN Version",
+                                info="Select WAN model version"
+                            )
+                            
+                            video_task = gr.Dropdown(
+                                choices=[
+                                    ("Text-to-Video 14B", "t2v-14B"),
+                                    ("Image-to-Video 14B", "i2v-14B"),
+                                    ("FLF2V 14B", "flf2v-14B"),
+                                    ("Text-to-Video A14B (WAN 2.2)", "t2v-A14B"),
+                                    ("Image-to-Video A14B (WAN 2.2)", "i2v-A14B"),
+                                    ("FLF2V A14B (WAN 2.2)", "flf2v-A14B")
+                                ],
+                                value="t2v-14B",
+                                label="Task",
+                                info="Select video generation task"
+                            )
+                            
+                            video_dit_path = gr.Textbox(
+                                label="DiT Model Path *",
+                                placeholder="path/to/wan2.x_model.safetensors",
+                                info="Main DiT model weights (required)"
+                            )
+                            
+                            video_dit_high_noise_path = gr.Textbox(
+                                label="DiT High Noise Path (WAN 2.2)",
+                                placeholder="path/to/wan2.2_high_noise_model.safetensors",
+                                info="High noise DiT model for WAN 2.2",
+                                visible=False
+                            )
+                            
+                            video_vae_path = gr.Textbox(
+                                label="VAE Model Path *",
+                                placeholder="path/to/wan_2.1_vae.safetensors",
+                                info="VAE model (required)"
+                            )
+                            
+                            video_t5_path = gr.Textbox(
+                                label="T5 Text Encoder Path *",
+                                placeholder="path/to/models_t5_umt5-xxl-enc-bf16.pth",
+                                info="T5 text encoder (required)"
+                            )
+                            
+                            video_clip_path = gr.Textbox(
+                                label="CLIP Model Path (WAN 2.1 only)",
+                                placeholder="path/to/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth",
+                                info="CLIP model required for WAN 2.1"
+                            )
+                            
+                            video_lora_path = gr.Textbox(
+                                label="LoRA Model Path (Optional)",
+                                placeholder="path/to/lora_model.safetensors",
+                                info="Optional: Apply trained LoRA"
+                            )
+                            
+                            video_lora_multiplier = gr.Slider(
+                                minimum=0.0,
+                                maximum=2.0,
+                                value=1.0,
+                                step=0.1,
+                                label="LoRA Multiplier"
+                            )
+                        
+                        with gr.Column():
+                            # Generation Settings
+                            gr.Markdown("#### Generation Settings")
+                            video_input_image = gr.Image(
+                                label="Input Image (I2V only)",
+                                type="filepath",
+                                # info="Starting image for I2V generation"
+                            )
+                            
+                            video_prompt = gr.Textbox(
+                                label="Prompt *",
+                                placeholder="A beautiful landscape with flowing water",
+                                lines=3,
+                                info="Generation prompt (required)"
+                            )
+                            
+                            video_negative_prompt = gr.Textbox(
+                                label="Negative Prompt",
+                                placeholder="blurry, low quality, distorted",
+                                lines=2,
+                                value="blurry, low quality, distorted"
+                            )
+                            
+                            with gr.Row():
+                                video_width = gr.Number(
+                                    value=256,
+                                    label="Width"
+                                )
+                                video_height = gr.Number(
+                                    value=256,
+                                    label="Height"
+                                )
+                                video_length = gr.Number(
+                                    value=16,
+                                    label="Video Length (frames)"
+                                )
+                            
+                            with gr.Row():
+                                video_steps = gr.Slider(
+                                    minimum=10,
+                                    maximum=50,
+                                    value=25,
+                                    step=1,
+                                    label="Inference Steps"
+                                )
+                                video_guidance_scale = gr.Slider(
+                                    minimum=1.0,
+                                    maximum=20.0,
+                                    value=7.0,
+                                    step=0.5,
+                                    label="Guidance Scale"
+                                )
+                            
+                            video_seed = gr.Number(
+                                value=-1,
+                                label="Seed",
+                                info="Random seed (-1 for random)"
+                            )
+            
+            # Advanced Settings (shared for both tabs)
+            with gr.Group():
+                gr.Markdown("#### Advanced Settings")
+                
+                with gr.Row():
+                    with gr.Column():
+                        gr.Markdown("**Performance Options**")
+                        
+                        attn_mode = gr.Dropdown(
+                            choices=[
+                                ("PyTorch SDPA (Default)", "torch"),
+                                ("Flash Attention 2", "flash2"),
+                                ("Flash Attention 3", "flash3"),
+                                ("xFormers", "xformers"),
+                                ("Sage Attention", "sageattn")
+                            ],
+                            value="torch",
+                            label="Attention Mode",
+                            info="Attention mechanism to use"
+                        )
+                        
+                        blocks_to_swap = gr.Slider(
+                            minimum=0,
+                            maximum=39,
+                            value=0,
+                            step=1,
+                            label="Blocks to Swap",
+                            info="Number of DiT blocks to swap to CPU (0=disable)"
+                        )
+                        
+                        enable_compile = gr.Checkbox(
+                            label="Enable torch.compile",
+                            value=False,
+                            info="Enable torch compilation for speed (experimental)"
+                        )
+                    
+                    with gr.Column():
+                        gr.Markdown("**FP8 Options**")
+                        
+                        fp8_base = gr.Checkbox(
+                            label="FP8 Base",
+                            value=False,
+                            info="Run DiT in FP8 mode (saves VRAM)"
+                        )
+                        
+                        fp8_scaled = gr.Checkbox(
+                            label="FP8 Scaled",
+                            value=False,
+                            info="FP8 weight optimization (requires FP8 Base)"
+                        )
+                        
+                        fp8_fast = gr.Checkbox(
+                            label="FP8 Fast (RTX 40x0)",
+                            value=False,
+                            info="Fastest FP8 mode for RTX 40x0 (may reduce quality)"
+                        )
+                        
+                        fp8_t5 = gr.Checkbox(
+                            label="FP8 T5",
+                            value=False,
+                            info="Run T5 text encoder in FP8 mode"
+                        )
+                
+                with gr.Row():
+                    with gr.Column():
+                        gr.Markdown("**WAN 2.2 Options**")
+                        
+                        timestep_boundary = gr.Slider(
+                            minimum=0.0,
+                            maximum=1.0,
+                            value=0.875,
+                            step=0.01,
+                            label="Timestep Boundary",
+                            info="Boundary for switching between models (WAN 2.2)"
+                        )
+                        
+                        guidance_scale_high_noise = gr.Slider(
+                            minimum=1.0,
+                            maximum=20.0,
+                            value=7.0,
+                            step=0.5,
+                            label="Guidance Scale (High Noise)",
+                            info="Separate guidance scale for high noise model"
+                        )
+                        
+                        offload_inactive_dit = gr.Checkbox(
+                            label="Offload Inactive DiT",
+                            value=False,
+                            info="Move inactive DiT to CPU (saves VRAM)"
+                        )
+                        
+                        lazy_loading = gr.Checkbox(
+                            label="Lazy Loading",
+                            value=False,
+                            info="Enable lazy loading for DiT models"
+                        )
+                    
+                    with gr.Column():
+                        gr.Markdown("**Memory Options**")
+                        
+                        vae_cache_cpu = gr.Checkbox(
+                            label="VAE Cache CPU",
+                            value=False,
+                            info="Cache VAE features in CPU memory"
+                        )
+                        
+                        flow_shift = gr.Number(
+                            value=3.0,
+                            label="Flow Shift",
+                            info="Flow shift parameter (3.0 for I2V 480p, 5.0 for others)"
+                        )
+                        
+                        trim_tail_frames = gr.Number(
+                            value=0,
+                            label="Trim Tail Frames",
+                            info="Number of frames to trim from end"
+                        )
+            
+            # Common inference controls
+            with gr.Group():
+                gr.Markdown("#### Execution")
+                with gr.Row():
+                    inference_output_dir = gr.Textbox(
+                        label="Output Directory",
+                        value="outputs/inference",
+                        info="Directory to save generated content"
+                    )
+                
+                with gr.Row():
+                    output_type = gr.Dropdown(
+                        label="Output Type",
+                        choices=["images", "latent", "both", "latent_images"],
+                        value="latent_images",
+                        info="Output format: images only, latents only, both, or latents+images (best for debugging)"
+                    )
+                
+                # VAE Decode Section
+                with gr.Group():
+                    gr.Markdown("#### VAE Decode & Debug")
+                    with gr.Row():
+                        latent_file_path = gr.Textbox(
+                            label="Latent File Path",
+                            placeholder="outputs/inference/timestamp_seed_latent.safetensors",
+                            info="Path to latent file for debugging VAE decode"
+                        )
+                        generate_vae_decode_btn = gr.Button("Generate VAE Decode Command", variant="secondary")
+                    
+                    with gr.Row():
+                        inspect_latents_btn = gr.Button("Inspect Latent Values", variant="secondary")
+                        debug_vae_stats_btn = gr.Button("VAE Stats & Preprocessing", variant="secondary")
+                    
+                    vae_decode_command_output = gr.Textbox(
+                        label="VAE Decode Command",
+                        lines=3,
+                        interactive=False,
+                        info="Command to decode latents for debugging"
+                    )
+                    
+                    latent_debug_output = gr.Textbox(
+                        label="Latent Debug Info",
+                        lines=5,
+                        interactive=False,
+                        info="Latent statistics and VAE preprocessing debug info"
+                    )
+                
+                with gr.Row():
+                    generate_i2v_btn = gr.Button("Generate I2V (1-Frame)", variant="primary", size="lg")
+                    generate_video_btn = gr.Button("Generate Video", variant="primary", size="lg")
+                    stop_inference_btn = gr.Button("Stop Generation", variant="stop")
+                
+                inference_command_output = gr.Textbox(
+                    label="Generated Command",
+                    lines=5,
+                    interactive=False,
+                    info="Command that will be executed"
+                )
+                
+                inference_status = gr.Textbox(
+                    label="Status",
+                    value="Ready",
+                    interactive=False
+                )
+                
+                inference_output = gr.Textbox(
+                    label="Generation Output",
+                    lines=10,
+                    interactive=False,
+                    info="Real-time output from generation process"
+                )
+            
+            # Configuration management
+            with gr.Group():
+                gr.Markdown("#### Configuration Management")
+                with gr.Row():
+                    inference_config_name = gr.Textbox(
+                        label="Config Name",
+                        placeholder="Enter configuration name",
+                        info="Name for saving/loading configurations"
+                    )
+                    inference_config_list = gr.Dropdown(
+                        label="Saved Configurations",
+                        choices=[],
+                        interactive=True,
+                        info="Select a saved configuration to load"
+                    )
+                
+                with gr.Row():
+                    save_inference_config_btn = gr.Button("Save Config", variant="secondary", size="sm")
+                    load_inference_config_btn = gr.Button("Load Config", variant="secondary", size="sm")
+                    delete_inference_config_btn = gr.Button("Delete Config", variant="stop", size="sm")
+                    refresh_inference_configs_btn = gr.Button("Refresh", variant="secondary", size="sm")
+                
+                inference_config_status = gr.Textbox(
+                    label="Config Status",
+                    value="Ready",
+                    interactive=False,
+                    lines=1
+                )
+        
+        # Add event handlers for WAN version changes
+        def update_i2v_ui_for_version(wan_version):
+            """Update I2V UI based on WAN version"""
+            is_wan22 = wan_version == "2.2"
+            # Keep all choices available for configuration loading, but set appropriate default
+            all_choices = [("I2V 14B", "i2v-14B"), ("I2V A14B (WAN 2.2)", "i2v-A14B")]
+            default_value = "i2v-A14B" if is_wan22 else "i2v-14B"
+            
+            return {
+                i2v_task: gr.Dropdown(choices=all_choices, value=default_value),
+                i2v_dit_high_noise_path: gr.Textbox(visible=is_wan22),
+                i2v_clip_path: gr.Textbox(visible=not is_wan22)
+            }
+        
+        def update_video_ui_for_version(wan_version):
+            """Update video UI based on WAN version"""
+            is_wan22 = wan_version == "2.2"
+            # Keep all choices available for configuration loading
+            all_choices = [
+                ("Text-to-Video 14B", "t2v-14B"),
+                ("Image-to-Video 14B", "i2v-14B"),
+                ("FLF2V 14B", "flf2v-14B"),
+                ("Text-to-Video A14B (WAN 2.2)", "t2v-A14B"),
+                ("Image-to-Video A14B (WAN 2.2)", "i2v-A14B"),
+                ("FLF2V A14B (WAN 2.2)", "flf2v-A14B")
+            ]
+            default_value = "t2v-A14B" if is_wan22 else "t2v-14B"
+            
+            return {
+                video_task: gr.Dropdown(choices=all_choices, value=default_value),
+                video_dit_high_noise_path: gr.Textbox(visible=is_wan22),
+                video_clip_path: gr.Textbox(visible=not is_wan22)
+            }
+        
+        def update_task_defaults(task):
+            """Update task-specific defaults for timestep boundary, guidance scale, and flow shift"""
+            task_defaults = {
+                # WAN 2.1 tasks
+                "t2v-14B": {"timestep_boundary": 0.875, "guidance_scale": 7.0, "guidance_scale_high_noise": 7.0, "flow_shift": 12.0},
+                "i2v-14B": {"timestep_boundary": 0.900, "guidance_scale": 3.5, "guidance_scale_high_noise": 3.5, "flow_shift": 5.0},
+                "flf2v-14B": {"timestep_boundary": 0.900, "guidance_scale": 3.5, "guidance_scale_high_noise": 3.5, "flow_shift": 5.0},
+                # WAN 2.2 tasks  
+                "t2v-A14B": {"timestep_boundary": 0.875, "guidance_scale": 3.0, "guidance_scale_high_noise": 4.0, "flow_shift": 12.0},
+                "i2v-A14B": {"timestep_boundary": 0.900, "guidance_scale": 3.5, "guidance_scale_high_noise": 3.5, "flow_shift": 5.0},
+                "flf2v-A14B": {"timestep_boundary": 0.900, "guidance_scale": 3.5, "guidance_scale_high_noise": 3.5, "flow_shift": 5.0},
+            }
+            
+            defaults = task_defaults.get(task, task_defaults["t2v-14B"])
+            return (
+                defaults["timestep_boundary"],
+                defaults["guidance_scale"], 
+                defaults["guidance_scale_high_noise"],
+                defaults["flow_shift"]
+            )
+        
+        i2v_wan_version.change(
+            update_i2v_ui_for_version,
+            inputs=[i2v_wan_version],
+            outputs=[i2v_task, i2v_dit_high_noise_path, i2v_clip_path]
+        )
+        
+        video_wan_version.change(
+            update_video_ui_for_version,
+            inputs=[video_wan_version],
+            outputs=[video_task, video_dit_high_noise_path, video_clip_path]
+        )
+        
+        # Add task change handlers to update defaults
+        video_task.change(
+            update_task_defaults,
+            inputs=[video_task],
+            outputs=[timestep_boundary, video_guidance_scale, guidance_scale_high_noise, flow_shift]
+        )
+        
+        return {
+            # I2V components
+            "i2v_wan_version": i2v_wan_version,
+            "i2v_task": i2v_task,
+            "i2v_dit_path": i2v_dit_path,
+            "i2v_dit_high_noise_path": i2v_dit_high_noise_path,
+            "i2v_vae_path": i2v_vae_path,
+            "i2v_t5_path": i2v_t5_path,
+            "i2v_clip_path": i2v_clip_path,
+            "i2v_lora_path": i2v_lora_path,
+            "i2v_lora_multiplier": i2v_lora_multiplier,
+            "i2v_input_image": i2v_input_image,
+            "i2v_prompt": i2v_prompt,
+            "i2v_negative_prompt": i2v_negative_prompt,
+            "i2v_width": i2v_width,
+            "i2v_height": i2v_height,
+            "i2v_steps": i2v_steps,
+            "i2v_guidance_scale": i2v_guidance_scale,
+            "i2v_target_index": i2v_target_index,
+            "i2v_control_index": i2v_control_index,
+            "i2v_seed": i2v_seed,
+            # Video components
+            "video_wan_version": video_wan_version,
+            "video_task": video_task,
+            "video_dit_path": video_dit_path,
+            "video_dit_high_noise_path": video_dit_high_noise_path,
+            "video_vae_path": video_vae_path,
+            "video_t5_path": video_t5_path,
+            "video_clip_path": video_clip_path,
+            "video_lora_path": video_lora_path,
+            "video_lora_multiplier": video_lora_multiplier,
+            "video_input_image": video_input_image,
+            "video_prompt": video_prompt,
+            "video_negative_prompt": video_negative_prompt,
+            "video_width": video_width,
+            "video_height": video_height,
+            "video_length": video_length,
+            "video_steps": video_steps,
+            "video_guidance_scale": video_guidance_scale,
+            "video_seed": video_seed,
+            # Advanced options
+            "attn_mode": attn_mode,
+            "blocks_to_swap": blocks_to_swap,
+            "enable_compile": enable_compile,
+            "fp8_base": fp8_base,
+            "fp8_scaled": fp8_scaled,
+            "fp8_fast": fp8_fast,
+            "fp8_t5": fp8_t5,
+            "timestep_boundary": timestep_boundary,
+            "guidance_scale_high_noise": guidance_scale_high_noise,
+            "offload_inactive_dit": offload_inactive_dit,
+            "lazy_loading": lazy_loading,
+            "vae_cache_cpu": vae_cache_cpu,
+            "flow_shift": flow_shift,
+            "trim_tail_frames": trim_tail_frames,
+            # Common components
+            "inference_output_dir": inference_output_dir,
+            "output_type": output_type,
+            "latent_file_path": latent_file_path,
+            "generate_vae_decode_btn": generate_vae_decode_btn,
+            "inspect_latents_btn": inspect_latents_btn,
+            "debug_vae_stats_btn": debug_vae_stats_btn,
+            "vae_decode_command_output": vae_decode_command_output,
+            "latent_debug_output": latent_debug_output,
+            "generate_i2v_btn": generate_i2v_btn,
+            "generate_video_btn": generate_video_btn,
+            "stop_inference_btn": stop_inference_btn,
+            "inference_command_output": inference_command_output,
+            "inference_status": inference_status,
+            "inference_output": inference_output,
+            # Configuration management components
+            "inference_config_name": inference_config_name,
+            "inference_config_list": inference_config_list,
+            "save_inference_config_btn": save_inference_config_btn,
+            "load_inference_config_btn": load_inference_config_btn,
+            "delete_inference_config_btn": delete_inference_config_btn,
+            "refresh_inference_configs_btn": refresh_inference_configs_btn,
+            "inference_config_status": inference_config_status
+        }
+    
     def create_training_execution_ui(self):
         """Create training execution UI"""
         with gr.Group():
@@ -837,11 +1522,476 @@ class MusubiTrainerUI:
             "training_output": training_output
         }
     
+    def build_i2v_inference_command(self, inference_config):
+        """Build command for I2V 1-frame inference with comprehensive WAN support"""
+        try:
+            venv_python = ".venv\\Scripts\\python.exe"
+            cmd = [venv_python, "src/musubi_tuner/wan_generate_video.py"]
+            
+            # Task (always use I2V for 1-frame inference)
+            task = inference_config.get("i2v_task", "i2v-14B")
+            cmd.extend(["--task", task])
+            
+            # Required model paths
+            if inference_config.get("i2v_dit_path"):
+                cmd.extend(["--dit", inference_config["i2v_dit_path"]])
+            else:
+                raise ValueError("DiT model path is required for I2V inference")
+            
+            # WAN 2.2 High Noise Model (if version is 2.2 and path provided)
+            wan_version = inference_config.get("i2v_wan_version", "2.1")
+            if wan_version == "2.2" and inference_config.get("i2v_dit_high_noise_path"):
+                cmd.extend(["--dit_high_noise", inference_config["i2v_dit_high_noise_path"]])
+            
+            if inference_config.get("i2v_vae_path"):
+                cmd.extend(["--vae", inference_config["i2v_vae_path"]])
+            else:
+                raise ValueError("VAE model path is required for I2V inference")
+            
+            if inference_config.get("i2v_t5_path"):
+                cmd.extend(["--t5", inference_config["i2v_t5_path"]])
+            else:
+                raise ValueError("T5 text encoder path is required for I2V inference")
+            
+            # CLIP model (required for WAN 2.1, not for WAN 2.2)
+            if wan_version == "2.1":
+                if inference_config.get("i2v_clip_path"):
+                    cmd.extend(["--clip", inference_config["i2v_clip_path"]])
+                else:
+                    raise ValueError("CLIP model path is required for WAN 2.1")
+            elif wan_version == "2.2" and inference_config.get("i2v_clip_path"):
+                # CLIP is optional for WAN 2.2 but can be provided
+                cmd.extend(["--clip", inference_config["i2v_clip_path"]])
+            
+            # LoRA (optional for 1-frame inference, but recommended for better results)
+            if inference_config.get("i2v_lora_path"):
+                cmd.extend(["--lora_weight", inference_config["i2v_lora_path"]])
+                cmd.extend(["--lora_multiplier", str(inference_config.get("i2v_lora_multiplier", 1.0))])
+            else:
+                print("WARNING: No LoRA specified for 1-frame inference. Results may be very similar to input image with noise. Consider using a LoRA for better quality.")
+            
+            # Required inference inputs
+            if inference_config.get("i2v_input_image"):
+                cmd.extend(["--image_path", inference_config["i2v_input_image"]])
+                cmd.extend(["--control_image_path", inference_config["i2v_input_image"]])
+            else:
+                raise ValueError("Input image is required for I2V inference")
+            
+            if inference_config.get("i2v_prompt"):
+                cmd.extend(["--prompt", f'"{inference_config["i2v_prompt"]}"'])
+            else:
+                raise ValueError("Prompt is required for I2V inference")
+            
+            # Optional generation parameters
+            if inference_config.get("i2v_negative_prompt"):
+                cmd.extend(["--negative_prompt", f'"{inference_config["i2v_negative_prompt"]}"'])
+            
+            # Image dimensions
+            height = int(inference_config.get("i2v_height", 576))
+            width = int(inference_config.get("i2v_width", 384))
+            cmd.extend(["--video_size", str(height), str(width)])
+            
+            # One-frame inference settings
+            target_index = int(inference_config.get("i2v_target_index", 1))
+            control_index = int(inference_config.get("i2v_control_index", 0))
+            one_frame_setting = f"target_index={target_index},control_index={control_index}"
+            cmd.extend(["--one_frame_inference", one_frame_setting])
+            
+            # Generation parameters
+            cmd.extend(["--infer_steps", str(int(inference_config.get("i2v_steps", 25)))])
+            cmd.extend(["--guidance_scale", str(inference_config.get("i2v_guidance_scale", 7.0))])
+            
+            # Seed
+            if inference_config.get("i2v_seed", -1) != -1:
+                cmd.extend(["--seed", str(int(inference_config["i2v_seed"]))])
+            
+            # Output settings
+            output_dir = inference_config.get("inference_output_dir", "outputs/inference")
+            cmd.extend(["--save_path", output_dir])
+            output_type = inference_config.get("output_type", "images")
+            cmd.extend(["--output_type", output_type])
+            
+            # Advanced Performance Options
+            attn_mode = inference_config.get("attn_mode", "torch")
+            if attn_mode != "torch":  # Only add flag if not default torch mode
+                cmd.extend(["--attn_mode", attn_mode])
+            
+            if inference_config.get("blocks_to_swap", 0) > 0:
+                cmd.extend(["--blocks_to_swap", str(int(inference_config["blocks_to_swap"]))])
+            
+            if inference_config.get("enable_compile", False):
+                cmd.append("--compile")
+            
+            # FP8 Options
+            if inference_config.get("fp8_base", False):
+                cmd.append("--fp8")
+            
+            if inference_config.get("fp8_scaled", False):
+                cmd.append("--fp8_scaled")
+            
+            if inference_config.get("fp8_fast", False):
+                cmd.append("--fp8_fast")
+            
+            if inference_config.get("fp8_t5", False):
+                cmd.append("--fp8_t5")
+            
+            # Force VAE to use float32 to match encode/decode methods
+            cmd.extend(["--vae_dtype", "float32"])
+            
+            # WAN 2.2 Specific Options
+            if wan_version == "2.2":
+                if inference_config.get("timestep_boundary") is not None:
+                    cmd.extend(["--timestep_boundary", str(inference_config["timestep_boundary"])])
+                
+                if inference_config.get("guidance_scale_high_noise") is not None:
+                    cmd.extend(["--guidance_scale_high_noise", str(inference_config["guidance_scale_high_noise"])])
+                
+                if inference_config.get("offload_inactive_dit", False):
+                    cmd.append("--offload_inactive_dit")
+                
+                if inference_config.get("lazy_loading", False):
+                    cmd.append("--lazy_loading")
+            
+            # Memory Options
+            if inference_config.get("vae_cache_cpu", False):
+                cmd.append("--vae_cache_cpu")
+            
+            if inference_config.get("flow_shift") is not None:
+                cmd.extend(["--flow_shift", str(inference_config["flow_shift"])])
+            
+            if inference_config.get("trim_tail_frames", 0) > 0:
+                cmd.extend(["--trim_tail_frames", str(int(inference_config["trim_tail_frames"]))])
+            
+            return " ".join(cmd)
+            
+        except Exception as e:
+            return f"Error building I2V command: {str(e)}"
+    
+    def build_video_inference_command(self, inference_config):
+        """Build standard video generation command with comprehensive WAN support"""
+        try:
+            venv_python = ".venv\\Scripts\\python.exe"
+            cmd = [venv_python, "src/musubi_tuner/wan_generate_video.py"]
+            
+            # Task
+            task = inference_config.get("video_task", "t2v-14B")
+            cmd.extend(["--task", task])
+            
+            # Required model paths
+            if inference_config.get("video_dit_path"):
+                cmd.extend(["--dit", inference_config["video_dit_path"]])
+            else:
+                raise ValueError("DiT model path is required for video generation")
+            
+            # WAN 2.2 High Noise Model (if version is 2.2 and path provided)
+            wan_version = inference_config.get("video_wan_version", "2.1")
+            if wan_version == "2.2" and inference_config.get("video_dit_high_noise_path"):
+                cmd.extend(["--dit_high_noise", inference_config["video_dit_high_noise_path"]])
+            
+            if inference_config.get("video_vae_path"):
+                cmd.extend(["--vae", inference_config["video_vae_path"]])
+            else:
+                raise ValueError("VAE model path is required for video generation")
+            
+            if inference_config.get("video_t5_path"):
+                cmd.extend(["--t5", inference_config["video_t5_path"]])
+            else:
+                raise ValueError("T5 text encoder path is required for video generation")
+            
+            # CLIP model (required for WAN 2.1, not for WAN 2.2)
+            if wan_version == "2.1":
+                if inference_config.get("video_clip_path"):
+                    cmd.extend(["--clip", inference_config["video_clip_path"]])
+                else:
+                    raise ValueError("CLIP model path is required for WAN 2.1")
+            elif wan_version == "2.2" and inference_config.get("video_clip_path"):
+                # CLIP is optional for WAN 2.2 but can be provided
+                cmd.extend(["--clip", inference_config["video_clip_path"]])
+            
+            # LoRA settings (optional for video generation)
+            if inference_config.get("video_lora_path"):
+                cmd.extend(["--lora_weight", inference_config["video_lora_path"]])
+                cmd.extend(["--lora_multiplier", str(inference_config.get("video_lora_multiplier", 1.0))])
+            
+            # Input handling based on task
+            if task in ["i2v-14B", "i2v-A14B", "flf2v-14B"]:
+                if inference_config.get("video_input_image"):
+                    cmd.extend(["--image_path", inference_config["video_input_image"]])
+                else:
+                    raise ValueError(f"Input image is required for {task}")
+            
+            # Required prompt
+            if inference_config.get("video_prompt"):
+                cmd.extend(["--prompt", f'"{inference_config["video_prompt"]}"'])
+            else:
+                raise ValueError("Prompt is required for video generation")
+            
+            # Optional negative prompt
+            if inference_config.get("video_negative_prompt"):
+                cmd.extend(["--negative_prompt", f'"{inference_config["video_negative_prompt"]}"'])
+            
+            # Video dimensions and length
+            height = int(inference_config.get("video_height", 256))
+            width = int(inference_config.get("video_width", 256))
+            length = int(inference_config.get("video_length", 16))
+            cmd.extend(["--video_size", str(height), str(width)])
+            cmd.extend(["--video_length", str(length)])
+            
+            # Generation settings
+            cmd.extend(["--infer_steps", str(int(inference_config.get("video_steps", 25)))])
+            cmd.extend(["--guidance_scale", str(inference_config.get("video_guidance_scale", 7.0))])
+            
+            # Seed
+            if inference_config.get("video_seed", -1) != -1:
+                cmd.extend(["--seed", str(int(inference_config["video_seed"]))])
+            
+            # Output path
+            output_dir = inference_config.get("inference_output_dir", "outputs/inference")
+            cmd.extend(["--save_path", output_dir])
+            output_type = inference_config.get("output_type", "video")
+            cmd.extend(["--output_type", output_type])
+            
+            # Advanced Performance Options
+            attn_mode = inference_config.get("attn_mode", "torch")
+            if attn_mode != "torch":  # Only add flag if not default torch mode
+                cmd.extend(["--attn_mode", attn_mode])
+            
+            if inference_config.get("blocks_to_swap", 0) > 0:
+                cmd.extend(["--blocks_to_swap", str(int(inference_config["blocks_to_swap"]))])
+            
+            if inference_config.get("enable_compile", False):
+                cmd.append("--compile")
+            
+            # FP8 Options
+            if inference_config.get("fp8_base", False):
+                cmd.append("--fp8")
+            
+            if inference_config.get("fp8_scaled", False):
+                cmd.append("--fp8_scaled")
+            
+            if inference_config.get("fp8_fast", False):
+                cmd.append("--fp8_fast")
+            
+            if inference_config.get("fp8_t5", False):
+                cmd.append("--fp8_t5")
+            
+            # Force VAE to use float32 to match encode/decode methods
+            cmd.extend(["--vae_dtype", "float32"])
+            
+            # WAN 2.2 Specific Options
+            if wan_version == "2.2":
+                if inference_config.get("timestep_boundary") is not None:
+                    cmd.extend(["--timestep_boundary", str(inference_config["timestep_boundary"])])
+                
+                if inference_config.get("guidance_scale_high_noise") is not None:
+                    cmd.extend(["--guidance_scale_high_noise", str(inference_config["guidance_scale_high_noise"])])
+                
+                if inference_config.get("offload_inactive_dit", False):
+                    cmd.append("--offload_inactive_dit")
+                
+                if inference_config.get("lazy_loading", False):
+                    cmd.append("--lazy_loading")
+            
+            # Memory Options
+            if inference_config.get("vae_cache_cpu", False):
+                cmd.append("--vae_cache_cpu")
+            
+            if inference_config.get("flow_shift") is not None:
+                cmd.extend(["--flow_shift", str(inference_config["flow_shift"])])
+            
+            if inference_config.get("trim_tail_frames", 0) > 0:
+                cmd.extend(["--trim_tail_frames", str(int(inference_config["trim_tail_frames"]))])
+            
+            return " ".join(cmd)
+            
+        except Exception as e:
+            return f"Error building video command: {str(e)}"
+    
+    def build_vae_decode_command(self, latent_path, base_inference_config):
+        """Build VAE decode command for debugging latent decoding"""
+        try:
+            if not latent_path or not latent_path.strip():
+                return "Error: Please specify a latent file path"
+            
+            venv_python = ".venv\\Scripts\\python.exe"
+            cmd = [venv_python, "src/musubi_tuner/wan_generate_video.py"]
+            
+            # Use latent decode mode
+            cmd.extend(["--latent_path", latent_path.strip()])
+            
+            # Copy essential model paths from base config
+            if base_inference_config.get("i2v_vae_path"):
+                cmd.extend(["--vae", base_inference_config["i2v_vae_path"]])
+            elif base_inference_config.get("video_vae_path"):
+                cmd.extend(["--vae", base_inference_config["video_vae_path"]])
+            else:
+                return "Error: VAE model path is required for latent decoding"
+            
+            # Determine task from base config or default
+            task = base_inference_config.get("i2v_task") or base_inference_config.get("video_task", "i2v-14B")
+            cmd.extend(["--task", task])
+            
+            # Output settings
+            output_dir = base_inference_config.get("inference_output_dir", "outputs/inference")
+            cmd.extend(["--save_path", output_dir])
+            cmd.extend(["--output_type", "images"])  # Always output images for decode
+            
+            # Force VAE to use float32 to match encode/decode methods
+            cmd.extend(["--vae_dtype", "float32"])
+            
+            # Add debugging metadata preservation
+            # cmd.extend(["--no_metadata"])  # Uncomment to disable metadata if needed
+            
+            return " ".join(cmd)
+            
+        except Exception as e:
+            return f"Error building VAE decode command: {str(e)}"
+    
+    def inspect_latent_values(self, latent_path):
+        """Inspect latent file values for debugging"""
+        try:
+            if not latent_path or not latent_path.strip():
+                return "Error: Please specify a latent file path"
+            
+            import torch
+            from safetensors.torch import load_file
+            import os
+            
+            latent_file = latent_path.strip()
+            if not os.path.exists(latent_file):
+                return f"Error: Latent file not found: {latent_file}"
+            
+            # Load latent data
+            data = load_file(latent_file)
+            latent = data.get('latent', None)
+            
+            if latent is None:
+                available_keys = list(data.keys())
+                return f"Error: No 'latent' key found. Available keys: {available_keys}"
+            
+            # Calculate statistics
+            shape = latent.shape
+            dtype = latent.dtype
+            mean_val = latent.mean().item()
+            std_val = latent.std().item()
+            min_val = latent.min().item()
+            max_val = latent.max().item()
+            
+            # Check for unusual patterns
+            zero_ratio = (latent == 0).float().mean().item()
+            nan_count = torch.isnan(latent).sum().item()
+            inf_count = torch.isinf(latent).sum().item()
+            
+            # Check if values are stuck at 0.5 or other suspicious patterns
+            half_ratio = (torch.abs(latent - 0.5) < 0.01).float().mean().item()
+            
+            report = f"""Latent File Analysis: {os.path.basename(latent_file)}
+═══════════════════════════════════════════════════════════
+Shape: {shape}
+Data Type: {dtype}
+Mean: {mean_val:.6f}
+Std Dev: {std_val:.6f}
+Min: {min_val:.6f}
+Max: {max_val:.6f}
+
+Quality Checks:
+• Zero values: {zero_ratio*100:.2f}% of values
+• NaN values: {nan_count} count
+• Inf values: {inf_count} count
+• Values near 0.5: {half_ratio*100:.2f}% (suspicious if high)
+
+Value Distribution (percentiles):
+• 1%: {torch.quantile(latent, 0.01).item():.6f}
+• 25%: {torch.quantile(latent, 0.25).item():.6f}
+• 50%: {torch.quantile(latent, 0.50).item():.6f}
+• 75%: {torch.quantile(latent, 0.75).item():.6f}
+• 99%: {torch.quantile(latent, 0.99).item():.6f}
+
+Diagnosis:
+"""
+            
+            # Add diagnostic information
+            if zero_ratio > 0.5:
+                report += "⚠️ WARNING: >50% zero values - possible generation failure\n"
+            if half_ratio > 0.3:
+                report += "⚠️ WARNING: Many values near 0.5 - possible stuck activation\n"
+            if std_val < 0.1:
+                report += "⚠️ WARNING: Very low variance - possible collapsed generation\n"
+            if nan_count > 0 or inf_count > 0:
+                report += "❌ ERROR: NaN/Inf values detected - numerical instability\n"
+            if abs(mean_val) < 0.01 and std_val > 0.5:
+                report += "✅ GOOD: Normal-looking latent distribution\n"
+            
+            return report
+            
+        except Exception as e:
+            return f"Error inspecting latent values: {str(e)}"
+    
+    def debug_vae_preprocessing(self, base_inference_config):
+        """Debug VAE preprocessing and model info"""
+        try:
+            # Get VAE path from config
+            vae_path = (base_inference_config.get("i2v_vae_path") or 
+                       base_inference_config.get("video_vae_path"))
+            
+            if not vae_path:
+                return "Error: No VAE model path found in configuration"
+            
+            report = f"""VAE Model & Preprocessing Debug
+═══════════════════════════════════════════════════════════
+VAE Model Path: {vae_path}
+VAE Data Type: float32 (forced for consistency)
+
+Expected VAE Preprocessing:
+• Input range: [-1, 1] (from image pixel values [0, 255])
+• Normalization: (pixel / 127.5) - 1.0
+• Channel order: RGB
+• VAE scaling factors:
+  - Mean: [-0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508, ...]
+  - Std:  [2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.7708, 2.6052, 2.0743, ...]
+
+Common Issues & Solutions:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. Gray Output:
+   • Check if latent values are mostly zeros/constant
+   • Verify VAE dtype consistency (should be float32)
+   • Check if guidance scale is too high/low
+   • Verify timestep boundary settings
+
+2. VAE Decode Issues:
+   • Ensure VAE weights are loaded correctly
+   • Check autocast dtype matches VAE dtype
+   • Verify latent scaling is applied correctly
+
+3. Preprocessing Issues:
+   • Input images should be normalized to [-1, 1]
+   • VAE expects RGB channel order
+   • Check image resizing doesn't corrupt data
+
+Debug Commands:
+• Use output_type='both' to save both latents and images
+• Use output_type='latent' to inspect raw latents
+• Compare latent statistics between working/broken generations
+• Check if different guidance scales affect output
+
+Recommended Settings for Debugging:
+• guidance_scale: 3.5 (I2V), 3.0-4.0 (T2V)
+• timestep_boundary: 0.900 (I2V), 0.875 (T2V)
+• flow_shift: 5.0 (I2V), 12.0 (T2V)
+• VAE dtype: float32
+• Inference steps: 20-30
+"""
+            
+            return report
+            
+        except Exception as e:
+            return f"Error generating VAE debug info: {str(e)}"
+    
     def build_training_command(self, model_config, training_config):
         """Build the training command from configuration"""
         try:
             # run in venv
-            accelerate_venv = ".venv/Scripts/accelerate.exe"
+            accelerate_venv = ".venv\\Scripts\\accelerate.exe"
             cmd = [accelerate_venv, "launch", "--num_cpu_threads_per_process", "1", 
                    "--mixed_precision", training_config["mixed_precision"]]
             
@@ -1003,6 +2153,9 @@ class MusubiTrainerUI:
                 
                 with gr.Tab("Training Execution"):
                     execution_components = self.create_training_execution_ui()
+                
+                with gr.Tab("Inference"):
+                    inference_components = self.create_inference_ui()
             
             # Setup event handlers for configuration management
             def save_configuration(config_name, *args):
@@ -1118,7 +2271,7 @@ class MusubiTrainerUI:
                         return error_msg
                     
                     print("DEBUG: Building command...")
-                    venv_python = ".venv/scripts/python.exe"
+                    venv_python = ".venv\\Scripts\\python.exe"
                     cmd = [venv_python, "src/musubi_tuner/wan_cache_latents.py"]
                     cmd.extend(["--dataset_config", training_config["dataset_config_path"]])
                     cmd.extend(["--vae", model_config["vae_path"]])
@@ -1218,7 +2371,7 @@ class MusubiTrainerUI:
                         return error_msg
                     
                     print("DEBUG: Building command...")
-                    venv_python = ".venv/scripts/python.exe"
+                    venv_python = ".venv\\Scripts\\python.exe"
                     cmd = [venv_python, "src/musubi_tuner/wan_cache_text_encoder_outputs.py"]
                     cmd.extend(["--dataset_config", training_config["dataset_config_path"]])
                     cmd.extend(["--t5", model_config["t5_path"]])
@@ -1518,6 +2671,674 @@ class MusubiTrainerUI:
                 outputs=[execution_components["training_status"]]
             )
             print("DEBUG: Refresh status button event handler connected")
+            
+            # Inference event handlers
+            def generate_i2v_inference(*args):
+                """Generate I2V one-frame inference command and execute"""
+                print("DEBUG: generate_i2v_inference called")
+                print(f"DEBUG: Received {len(args)} arguments")
+                
+                try:
+                    # Extract inference configuration from ALL components
+                    inference_config = {
+                        # I2V components (indices 0-18)
+                        "i2v_wan_version": args[0],
+                        "i2v_task": args[1],
+                        "i2v_dit_path": args[2],
+                        "i2v_dit_high_noise_path": args[3],
+                        "i2v_vae_path": args[4],
+                        "i2v_t5_path": args[5],
+                        "i2v_clip_path": args[6],
+                        "i2v_lora_path": args[7],
+                        "i2v_lora_multiplier": args[8],
+                        "i2v_input_image": args[9],
+                        "i2v_prompt": args[10],
+                        "i2v_negative_prompt": args[11],
+                        "i2v_width": args[12],
+                        "i2v_height": args[13],
+                        "i2v_steps": args[14],
+                        "i2v_guidance_scale": args[15],
+                        "i2v_target_index": args[16],
+                        "i2v_control_index": args[17],
+                        "i2v_seed": args[18],
+                        # Video components (indices 19-36) - not used for I2V but included for completeness
+                        "video_wan_version": args[19],
+                        "video_task": args[20],
+                        "video_dit_path": args[21],
+                        "video_dit_high_noise_path": args[22],
+                        "video_vae_path": args[23],
+                        "video_t5_path": args[24],
+                        "video_clip_path": args[25],
+                        "video_lora_path": args[26],
+                        "video_lora_multiplier": args[27],
+                        "video_input_image": args[28],
+                        "video_prompt": args[29],
+                        "video_negative_prompt": args[30],
+                        "video_width": args[31],
+                        "video_height": args[32],
+                        "video_length": args[33],
+                        "video_steps": args[34],
+                        "video_guidance_scale": args[35],
+                        "video_seed": args[36],
+                        # Advanced options (indices 37-49)
+                        "attn_mode": args[37],
+                        "blocks_to_swap": args[38],
+                        "enable_compile": args[39],
+                        "fp8_base": args[40],
+                        "fp8_scaled": args[41],
+                        "fp8_fast": args[42],
+                        "fp8_t5": args[43],
+                        "timestep_boundary": args[44],
+                        "guidance_scale_high_noise": args[45],
+                        "offload_inactive_dit": args[46],
+                        "lazy_loading": args[47],
+                        "vae_cache_cpu": args[48],
+                        "flow_shift": args[49],
+                        "trim_tail_frames": args[50],
+                        # Common components
+                        "inference_output_dir": args[51],
+                        "output_type": args[52]
+                    }
+                    
+                    print(f"DEBUG: I2V config extracted - prompt: '{inference_config['i2v_prompt']}', task: '{inference_config['i2v_task']}'")
+                    
+                    # Build command
+                    print("DEBUG: Building I2V inference command...")
+                    command = self.build_i2v_inference_command(inference_config)
+                    print(f"DEBUG: Generated command: {command}")
+                    
+                    # Check if command generation failed
+                    if not command or command.startswith("Error"):
+                        error_msg = f"Failed to generate I2V command: {command}"
+                        print(f"DEBUG: {error_msg}")
+                        return error_msg, "Error", error_msg
+                    
+                    # Start inference in background
+                    def run_inference():
+                        try:
+                            print(f"DEBUG: Starting I2V inference process with command: {command}")
+                            process = subprocess.Popen(
+                                command,
+                                shell=True,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT,
+                                text=True,
+                                bufsize=1,
+                                universal_newlines=True
+                            )
+                            
+                            print(f"DEBUG: I2V inference process started with PID: {process.pid}")
+                            
+                            output_lines = []
+                            for line in process.stdout:
+                                line = line.strip()
+                                if line:  # Only add non-empty lines
+                                    output_lines.append(line)
+                                    print(f"DEBUG: I2V output: {line}")
+                                    if len(output_lines) > 100:  # Keep only last 100 lines
+                                        output_lines = output_lines[-100:]
+                            
+                            return_code = process.wait()
+                            print(f"DEBUG: I2V inference completed with return code: {return_code}")
+                            
+                            if return_code == 0:
+                                final_output = "\n".join(output_lines) + "\n\n=== I2V inference completed successfully ==="
+                                print("DEBUG: I2V inference completed successfully")
+                            else:
+                                final_output = "\n".join(output_lines) + f"\n\n=== I2V inference failed with exit code {return_code} ==="
+                                print(f"DEBUG: I2V inference failed with exit code {return_code}")
+                                
+                        except Exception as e:
+                            final_output = f"Error during I2V inference: {str(e)}"
+                            print(f"DEBUG: Exception in I2V inference: {str(e)}")
+                    
+                    # Start inference thread
+                    print("DEBUG: Starting I2V inference thread...")
+                    inference_thread = threading.Thread(target=run_inference, daemon=True)
+                    inference_thread.start()
+                    
+                    return command, "I2V inference started...", "I2V inference in progress..."
+                    
+                except Exception as e:
+                    error_msg = f"Error starting I2V inference: {str(e)}"
+                    print(f"DEBUG: {error_msg}")
+                    return error_msg, "Error", error_msg
+            
+            def generate_video_inference(*args):
+                """Generate video inference command and execute"""
+                print("DEBUG: generate_video_inference called")
+                print(f"DEBUG: Received {len(args)} arguments")
+                
+                try:
+                    # Extract video inference configuration from ALL components
+                    inference_config = {
+                        # I2V components (indices 0-18) - not used for video but included for completeness
+                        "i2v_wan_version": args[0],
+                        "i2v_task": args[1],
+                        "i2v_dit_path": args[2],
+                        "i2v_dit_high_noise_path": args[3],
+                        "i2v_vae_path": args[4],
+                        "i2v_t5_path": args[5],
+                        "i2v_clip_path": args[6],
+                        "i2v_lora_path": args[7],
+                        "i2v_lora_multiplier": args[8],
+                        "i2v_input_image": args[9],
+                        "i2v_prompt": args[10],
+                        "i2v_negative_prompt": args[11],
+                        "i2v_width": args[12],
+                        "i2v_height": args[13],
+                        "i2v_steps": args[14],
+                        "i2v_guidance_scale": args[15],
+                        "i2v_target_index": args[16],
+                        "i2v_control_index": args[17],
+                        "i2v_seed": args[18],
+                        # Video components (indices 19-36) - primary for video generation
+                        "video_wan_version": args[19],
+                        "video_task": args[20],
+                        "video_dit_path": args[21],
+                        "video_dit_high_noise_path": args[22],
+                        "video_vae_path": args[23],
+                        "video_t5_path": args[24],
+                        "video_clip_path": args[25],
+                        "video_lora_path": args[26],
+                        "video_lora_multiplier": args[27],
+                        "video_input_image": args[28],
+                        "video_prompt": args[29],
+                        "video_negative_prompt": args[30],
+                        "video_width": args[31],
+                        "video_height": args[32],
+                        "video_length": args[33],
+                        "video_steps": args[34],
+                        "video_guidance_scale": args[35],
+                        "video_seed": args[36],
+                        # Advanced options (indices 37-49)
+                        "attn_mode": args[37],
+                        "blocks_to_swap": args[38],
+                        "enable_compile": args[39],
+                        "fp8_base": args[40],
+                        "fp8_scaled": args[41],
+                        "fp8_fast": args[42],
+                        "fp8_t5": args[43],
+                        "timestep_boundary": args[44],
+                        "guidance_scale_high_noise": args[45],
+                        "offload_inactive_dit": args[46],
+                        "lazy_loading": args[47],
+                        "vae_cache_cpu": args[48],
+                        "flow_shift": args[49],
+                        "trim_tail_frames": args[50],
+                        # Common components
+                        "inference_output_dir": args[51],
+                        "output_type": args[52]
+                    }
+                    
+                    print(f"DEBUG: Video config extracted - prompt: '{inference_config['video_prompt']}', task: '{inference_config['video_task']}'")
+                    
+                    # Build command
+                    print("DEBUG: Building video inference command...")
+                    command = self.build_video_inference_command(inference_config)
+                    print(f"DEBUG: Generated command: {command}")
+                    
+                    # Check if command generation failed
+                    if not command or command.startswith("Error"):
+                        error_msg = f"Failed to generate video command: {command}"
+                        print(f"DEBUG: {error_msg}")
+                        return error_msg, "Error", error_msg
+                    
+                    # Start inference in background
+                    def run_inference():
+                        try:
+                            print(f"DEBUG: Starting video inference process with command: {command}")
+                            process = subprocess.Popen(
+                                command,
+                                shell=True,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT,
+                                text=True,
+                                bufsize=1,
+                                universal_newlines=True
+                            )
+                            
+                            print(f"DEBUG: Video inference process started with PID: {process.pid}")
+                            
+                            output_lines = []
+                            for line in process.stdout:
+                                line = line.strip()
+                                if line:  # Only add non-empty lines
+                                    output_lines.append(line)
+                                    print(f"DEBUG: Video output: {line}")
+                                    if len(output_lines) > 100:  # Keep only last 100 lines
+                                        output_lines = output_lines[-100:]
+                            
+                            return_code = process.wait()
+                            print(f"DEBUG: Video inference completed with return code: {return_code}")
+                            
+                            if return_code == 0:
+                                final_output = "\n".join(output_lines) + "\n\n=== Video inference completed successfully ==="
+                                print("DEBUG: Video inference completed successfully")
+                            else:
+                                final_output = "\n".join(output_lines) + f"\n\n=== Video inference failed with exit code {return_code} ==="
+                                print(f"DEBUG: Video inference failed with exit code {return_code}")
+                                
+                        except Exception as e:
+                            final_output = f"Error during video inference: {str(e)}"
+                            print(f"DEBUG: Exception in video inference: {str(e)}")
+                    
+                    # Start inference thread
+                    print("DEBUG: Starting video inference thread...")
+                    inference_thread = threading.Thread(target=run_inference, daemon=True)
+                    inference_thread.start()
+                    
+                    return command, "Video inference started...", "Video inference in progress..."
+                    
+                except Exception as e:
+                    error_msg = f"Error starting video inference: {str(e)}"
+                    print(f"DEBUG: {error_msg}")
+                    return error_msg, "Error", error_msg
+
+            def generate_vae_decode_command(latent_path, *args):
+                """Generate VAE decode command for debugging"""
+                print("DEBUG: generate_vae_decode_command called")
+                print(f"DEBUG: latent_path='{latent_path}', args_count={len(args)}")
+                
+                try:
+                    # Extract basic inference configuration for VAE models
+                    inference_config = {
+                        # I2V components
+                        "i2v_vae_path": args[3] if len(args) > 3 else "",
+                        "i2v_task": args[1] if len(args) > 1 else "i2v-14B",
+                        # Video components
+                        "video_vae_path": args[22] if len(args) > 22 else "",
+                        "video_task": args[19] if len(args) > 19 else "t2v-14B",
+                        # Common settings
+                        "inference_output_dir": args[48] if len(args) > 48 else "outputs/inference",
+                    }
+                    
+                    # Generate VAE decode command
+                    command = self.build_vae_decode_command(latent_path, inference_config)
+                    return command
+                    
+                except Exception as e:
+                    error_msg = f"Error generating VAE decode command: {str(e)}"
+                    print(f"DEBUG: {error_msg}")
+                    return error_msg
+
+            def inspect_latent_values_callback(latent_path):
+                """Callback to inspect latent values"""
+                print("DEBUG: inspect_latent_values_callback called")
+                print(f"DEBUG: latent_path='{latent_path}'")
+                
+                try:
+                    return self.inspect_latent_values(latent_path)
+                except Exception as e:
+                    error_msg = f"Error inspecting latent values: {str(e)}"
+                    print(f"DEBUG: {error_msg}")
+                    return error_msg
+
+            def debug_vae_stats_callback(*args):
+                """Callback to generate VAE preprocessing debug info"""
+                print("DEBUG: debug_vae_stats_callback called")
+                print(f"DEBUG: args_count={len(args)}")
+                
+                try:
+                    # Extract basic inference configuration for VAE models
+                    inference_config = {
+                        # I2V components
+                        "i2v_vae_path": args[3] if len(args) > 3 else "",
+                        "i2v_task": args[1] if len(args) > 1 else "i2v-14B",
+                        # Video components
+                        "video_vae_path": args[22] if len(args) > 22 else "",
+                        "video_task": args[19] if len(args) > 19 else "t2v-14B",
+                    }
+                    
+                    return self.debug_vae_preprocessing(inference_config)
+                except Exception as e:
+                    error_msg = f"Error generating VAE debug info: {str(e)}"
+                    print(f"DEBUG: {error_msg}")
+                    return error_msg
+
+            # Inference Configuration Management Functions
+            def save_inference_configuration(config_name, *args):
+                """Save inference configuration to file"""
+                print(f"DEBUG: save_inference_configuration called with config_name='{config_name}', args_count={len(args)}")
+                
+                try:
+                    if not config_name or config_name.strip() == "":
+                        return "Please enter a configuration name"
+                    
+                    # Extract configuration from ALL components
+                    inference_config = {
+                        # I2V components
+                        "i2v_wan_version": args[0] if len(args) > 0 else "2.1",
+                        "i2v_task": args[1] if len(args) > 1 else "i2v-14B",
+                        "i2v_dit_path": args[2] if len(args) > 2 else "",
+                        "i2v_dit_high_noise_path": args[3] if len(args) > 3 else "",
+                        "i2v_vae_path": args[4] if len(args) > 4 else "",
+                        "i2v_t5_path": args[5] if len(args) > 5 else "",
+                        "i2v_clip_path": args[6] if len(args) > 6 else "",
+                        "i2v_lora_path": args[7] if len(args) > 7 else "",
+                        "i2v_lora_multiplier": args[8] if len(args) > 8 else 1.0,
+                        "i2v_input_image": args[9] if len(args) > 9 else None,
+                        "i2v_prompt": args[10] if len(args) > 10 else "",
+                        "i2v_negative_prompt": args[11] if len(args) > 11 else "",
+                        "i2v_width": args[12] if len(args) > 12 else 384,
+                        "i2v_height": args[13] if len(args) > 13 else 576,
+                        "i2v_steps": args[14] if len(args) > 14 else 25,
+                        "i2v_guidance_scale": args[15] if len(args) > 15 else 7.0,
+                        "i2v_target_index": args[16] if len(args) > 16 else 1,
+                        "i2v_control_index": args[17] if len(args) > 17 else 0,
+                        "i2v_seed": args[18] if len(args) > 18 else -1,
+                        # Video components
+                        "video_wan_version": args[19] if len(args) > 19 else "2.1",
+                        "video_task": args[20] if len(args) > 20 else "t2v-14B",
+                        "video_dit_path": args[21] if len(args) > 21 else "",
+                        "video_dit_high_noise_path": args[22] if len(args) > 22 else "",
+                        "video_vae_path": args[23] if len(args) > 23 else "",
+                        "video_t5_path": args[24] if len(args) > 24 else "",
+                        "video_clip_path": args[25] if len(args) > 25 else "",
+                        "video_lora_path": args[26] if len(args) > 26 else "",
+                        "video_lora_multiplier": args[27] if len(args) > 27 else 1.0,
+                        "video_input_image": args[28] if len(args) > 28 else None,
+                        "video_prompt": args[29] if len(args) > 29 else "",
+                        "video_negative_prompt": args[30] if len(args) > 30 else "",
+                        "video_width": args[31] if len(args) > 31 else 256,
+                        "video_height": args[32] if len(args) > 32 else 256,
+                        "video_length": args[33] if len(args) > 33 else 16,
+                        "video_steps": args[34] if len(args) > 34 else 25,
+                        "video_guidance_scale": args[35] if len(args) > 35 else 7.0,
+                        "video_seed": args[36] if len(args) > 36 else -1,
+                        # Advanced options
+                        "attn_mode": args[37] if len(args) > 37 else "torch",
+                        "blocks_to_swap": args[38] if len(args) > 38 else 0,
+                        "enable_compile": args[39] if len(args) > 39 else False,
+                        "fp8_base": args[40] if len(args) > 40 else False,
+                        "fp8_scaled": args[41] if len(args) > 41 else False,
+                        "fp8_fast": args[42] if len(args) > 42 else False,
+                        "fp8_t5": args[43] if len(args) > 43 else False,
+                        "timestep_boundary": args[44] if len(args) > 44 else 0.875,
+                        "guidance_scale_high_noise": args[45] if len(args) > 45 else 7.0,
+                        "offload_inactive_dit": args[46] if len(args) > 46 else False,
+                        "lazy_loading": args[47] if len(args) > 47 else False,
+                        "vae_cache_cpu": args[48] if len(args) > 48 else False,
+                        "flow_shift": args[49] if len(args) > 49 else 3.0,
+                        "trim_tail_frames": args[50] if len(args) > 50 else 0,
+                        # Common components
+                        "inference_output_dir": args[51] if len(args) > 51 else "outputs/inference",
+                        "output_type": args[52] if len(args) > 52 else "images"
+                    }
+                    
+                    # Save configuration to file
+                    import os
+                    import json
+                    
+                    configs_dir = "configs/inference"
+                    os.makedirs(configs_dir, exist_ok=True)
+                    
+                    config_file = os.path.join(configs_dir, f"{config_name}.json")
+                    with open(config_file, 'w') as f:
+                        json.dump(inference_config, f, indent=2)
+                    
+                    return f"Inference configuration '{config_name}' saved successfully"
+                    
+                except Exception as e:
+                    error_msg = f"Error saving inference configuration: {str(e)}"
+                    print(f"DEBUG: {error_msg}")
+                    return error_msg
+
+            def load_inference_configuration(config_name):
+                """Load inference configuration from file"""
+                print(f"DEBUG: load_inference_configuration called with config_name='{config_name}'")
+                
+                try:
+                    if not config_name or config_name.strip() == "":
+                        return [None] * 52 + ["Please select a configuration to load"]
+                    
+                    import os
+                    import json
+                    
+                    config_file = os.path.join("configs/inference", f"{config_name}.json")
+                    
+                    if not os.path.exists(config_file):
+                        return [None] * 52 + [f"Configuration '{config_name}' not found"]
+                    
+                    with open(config_file, 'r') as f:
+                        config = json.load(f)
+                    
+                    # Return all values in the correct order for the UI components
+                    return [
+                        # I2V components
+                        config.get("i2v_wan_version", "2.1"),
+                        config.get("i2v_task", "i2v-14B"),
+                        config.get("i2v_dit_path", ""),
+                        config.get("i2v_dit_high_noise_path", ""),
+                        config.get("i2v_vae_path", ""),
+                        config.get("i2v_t5_path", ""),
+                        config.get("i2v_clip_path", ""),
+                        config.get("i2v_lora_path", ""),
+                        config.get("i2v_lora_multiplier", 1.0),
+                        config.get("i2v_input_image", None),
+                        config.get("i2v_prompt", ""),
+                        config.get("i2v_negative_prompt", ""),
+                        config.get("i2v_width", 384),
+                        config.get("i2v_height", 576),
+                        config.get("i2v_steps", 25),
+                        config.get("i2v_guidance_scale", 7.0),
+                        config.get("i2v_target_index", 1),
+                        config.get("i2v_control_index", 0),
+                        config.get("i2v_seed", -1),
+                        # Video components
+                        config.get("video_wan_version", "2.1"),
+                        config.get("video_task", "t2v-14B"),
+                        config.get("video_dit_path", ""),
+                        config.get("video_dit_high_noise_path", ""),
+                        config.get("video_vae_path", ""),
+                        config.get("video_t5_path", ""),
+                        config.get("video_clip_path", ""),
+                        config.get("video_lora_path", ""),
+                        config.get("video_lora_multiplier", 1.0),
+                        config.get("video_input_image", None),
+                        config.get("video_prompt", ""),
+                        config.get("video_negative_prompt", ""),
+                        config.get("video_width", 256),
+                        config.get("video_height", 256),
+                        config.get("video_length", 16),
+                        config.get("video_steps", 25),
+                        config.get("video_guidance_scale", 7.0),
+                        config.get("video_seed", -1),
+                        # Advanced options
+                        config.get("attn_mode", "torch"),
+                        config.get("blocks_to_swap", 0),
+                        config.get("enable_compile", False),
+                        config.get("fp8_base", False),
+                        config.get("fp8_scaled", False),
+                        config.get("fp8_fast", False),
+                        config.get("fp8_t5", False),
+                        config.get("timestep_boundary", 0.875),
+                        config.get("guidance_scale_high_noise", 7.0),
+                        config.get("offload_inactive_dit", False),
+                        config.get("lazy_loading", False),
+                        config.get("vae_cache_cpu", False),
+                        config.get("flow_shift", 3.0),
+                        config.get("trim_tail_frames", 0),
+                        # Common components
+                        config.get("inference_output_dir", "outputs/inference"),
+                        config.get("output_type", "images")
+                    ] + [f"Configuration '{config_name}' loaded successfully"]
+                    
+                except Exception as e:
+                    error_msg = f"Error loading inference configuration: {str(e)}"
+                    print(f"DEBUG: {error_msg}")
+                    return [None] * 53 + [error_msg]  # Return empty values for all components + error message
+
+            def delete_inference_configuration(config_name):
+                """Delete inference configuration file"""
+                try:
+                    if not config_name or config_name.strip() == "":
+                        return "Please select a configuration to delete"
+                    
+                    import os
+                    
+                    config_file = os.path.join("configs/inference", f"{config_name}.json")
+                    
+                    if not os.path.exists(config_file):
+                        return f"Configuration '{config_name}' not found"
+                    
+                    os.remove(config_file)
+                    return f"Configuration '{config_name}' deleted successfully"
+                    
+                except Exception as e:
+                    return f"Error deleting configuration: {str(e)}"
+
+            def refresh_inference_configs():
+                """Refresh the list of available inference configurations"""
+                try:
+                    import os
+                    
+                    configs_dir = "configs/inference"
+                    if not os.path.exists(configs_dir):
+                        return gr.Dropdown(choices=[])
+                    
+                    config_files = [f[:-5] for f in os.listdir(configs_dir) if f.endswith('.json')]
+                    config_files.sort()
+                    
+                    return gr.Dropdown(choices=config_files)
+                    
+                except Exception as e:
+                    print(f"Error refreshing inference configs: {str(e)}")
+                    return gr.Dropdown(choices=[])
+
+            # Get inference component inputs - ALL components for complete config saving
+            inference_inputs = [
+                # I2V inputs (20 components, indices 0-19)
+                inference_components["i2v_wan_version"],
+                inference_components["i2v_task"],
+                inference_components["i2v_dit_path"],
+                inference_components["i2v_dit_high_noise_path"],
+                inference_components["i2v_vae_path"],
+                inference_components["i2v_t5_path"],
+                inference_components["i2v_clip_path"],
+                inference_components["i2v_lora_path"],
+                inference_components["i2v_lora_multiplier"],
+                inference_components["i2v_input_image"],
+                inference_components["i2v_prompt"],
+                inference_components["i2v_negative_prompt"],
+                inference_components["i2v_width"],
+                inference_components["i2v_height"],
+                inference_components["i2v_steps"],
+                inference_components["i2v_guidance_scale"],
+                inference_components["i2v_target_index"],
+                inference_components["i2v_control_index"],
+                inference_components["i2v_seed"],
+                # Video inputs (18 components, indices 19-36)
+                inference_components["video_wan_version"],
+                inference_components["video_task"],
+                inference_components["video_dit_path"],
+                inference_components["video_dit_high_noise_path"],
+                inference_components["video_vae_path"],
+                inference_components["video_t5_path"],
+                inference_components["video_clip_path"],
+                inference_components["video_lora_path"],
+                inference_components["video_lora_multiplier"],
+                inference_components["video_input_image"],
+                inference_components["video_prompt"],
+                inference_components["video_negative_prompt"],
+                inference_components["video_width"],
+                inference_components["video_height"],
+                inference_components["video_length"],
+                inference_components["video_steps"],
+                inference_components["video_guidance_scale"],
+                inference_components["video_seed"],
+                # Advanced options (12 components, indices 37-48)
+                inference_components["attn_mode"],
+                inference_components["blocks_to_swap"],
+                inference_components["enable_compile"],
+                inference_components["fp8_base"],
+                inference_components["fp8_scaled"],
+                inference_components["fp8_fast"],
+                inference_components["fp8_t5"],
+                inference_components["timestep_boundary"],
+                inference_components["guidance_scale_high_noise"],
+                inference_components["offload_inactive_dit"],
+                inference_components["lazy_loading"],
+                inference_components["vae_cache_cpu"],
+                inference_components["flow_shift"],
+                inference_components["trim_tail_frames"],
+                # Common components (2 components, indices 51-52)
+                inference_components["inference_output_dir"],
+                inference_components["output_type"]
+            ]
+            
+            # Connect inference event handlers
+            inference_components["generate_i2v_btn"].click(
+                generate_i2v_inference,
+                inputs=inference_inputs,
+                outputs=[
+                    inference_components["inference_command_output"],
+                    inference_components["inference_status"],
+                    inference_components["inference_output"]
+                ]
+            )
+            print("DEBUG: Generate I2V inference button event handler connected")
+            
+            inference_components["generate_video_btn"].click(
+                generate_video_inference,
+                inputs=inference_inputs,
+                outputs=[
+                    inference_components["inference_command_output"],
+                    inference_components["inference_status"],
+                    inference_components["inference_output"]
+                ]
+            )
+            print("DEBUG: Generate video inference button event handler connected")
+            
+            inference_components["generate_vae_decode_btn"].click(
+                generate_vae_decode_command,
+                inputs=[inference_components["latent_file_path"]] + inference_inputs,
+                outputs=inference_components["vae_decode_command_output"]
+            )
+            print("DEBUG: Generate VAE decode command button event handler connected")
+            
+            inference_components["inspect_latents_btn"].click(
+                inspect_latent_values_callback,
+                inputs=inference_components["latent_file_path"],
+                outputs=inference_components["latent_debug_output"]
+            )
+            print("DEBUG: Inspect latents button event handler connected")
+            
+            inference_components["debug_vae_stats_btn"].click(
+                debug_vae_stats_callback,
+                inputs=inference_inputs,
+                outputs=inference_components["latent_debug_output"]
+            )
+            print("DEBUG: Debug VAE stats button event handler connected")
+            
+            # Connect inference configuration management event handlers
+            # All inference config components for input (name + all components)
+            inference_config_inputs = [inference_components["inference_config_name"]] + inference_inputs
+            
+            inference_components["save_inference_config_btn"].click(
+                save_inference_configuration,
+                inputs=inference_config_inputs,
+                outputs=[inference_components["inference_config_status"]]
+            )
+            
+            inference_components["load_inference_config_btn"].click(
+                load_inference_configuration,
+                inputs=[inference_components["inference_config_list"]],
+                outputs=inference_inputs + [inference_components["inference_config_status"]]
+            )
+            
+            inference_components["delete_inference_config_btn"].click(
+                delete_inference_configuration,
+                inputs=[inference_components["inference_config_list"]],
+                outputs=[inference_components["inference_config_status"]]
+            )
+            
+            inference_components["refresh_inference_configs_btn"].click(
+                refresh_inference_configs,
+                outputs=[inference_components["inference_config_list"]]
+            )
+            
+            print("DEBUG: Inference configuration management button event handlers connected")
         
         return interface
     
